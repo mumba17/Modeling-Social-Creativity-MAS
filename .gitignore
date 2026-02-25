@@ -1,0 +1,8 @@
+/exported_logs
+/logs
+/__pycache__
+test_pipeline.py
+/pytorch_images_20241126_031908
+/Data
+run_modularity_experiment.bat
+test.png
