@@ -6,3 +6,4 @@ test_pipeline.py
 /Data
 run_modularity_experiment.bat
 test.png
+.vscode/settings.json

@@ -17,7 +17,7 @@ simulation. It implements Algorithm 1 from the thesis:
 DEVIATION(paper 3.5): All phases use batched GPU pipelines
 rather than sequential per-agent processing. This is a pure
 performance optimization that does not change algorithmic
-semantics — all agents still see the same memory snapshot
+semantics; all agents still see the same memory snapshot
 within each phase.
 """
 
@@ -167,7 +167,8 @@ class ParallelScheduler(Scheduler):
                  share_count: int = 5, uniform_novelty_pref: bool = False,
                  use_static_noise: bool = False, feature_dims: int = 0,
                  pca_calibration_samples: int = 500, distance_metric: str = 'cosine',
-                 boredom_mode: str = 'extended', save_images: bool = False,
+                 boredom_mode: str = 'extended', adopt_shared_expression: bool = False,
+                 save_images: bool = False,
                  image_output_dir: str = None):
         """
         Initializes the ParallelScheduler.
@@ -186,6 +187,7 @@ class ParallelScheduler(Scheduler):
         self.uniform_novelty_pref = uniform_novelty_pref
         self.distance_metric = distance_metric
         self.boredom_mode = boredom_mode
+        self.adopt_shared_expression = adopt_shared_expression
         self.save_images = save_images
         self.image_output_dir = image_output_dir
 
@@ -376,7 +378,7 @@ class ParallelScheduler(Scheduler):
         """
         Renders expression trees to images and extracts feature
         vectors (3.3.2). This is a helper phase not explicitly
-        in Algorithm 1 — it prepares the data needed by
+        in Algorithm 1 as it prepares the data needed by
         individual_evaluation_phase and interaction_phase.
 
         DEVIATION(paper 3.5): All artifacts are rendered and
@@ -400,7 +402,7 @@ class ParallelScheduler(Scheduler):
                 image_path = os.path.join(self.image_output_dir, f"{artifact.id}.png")
                 torchvision.utils.save_image(image_batch_cpu[i], image_path)
         
-        # 2. ImageNet normalization on GPU — required because
+        # 2. ImageNet normalization on GPU -- required because
         # ResNet-18 was pre-trained on ImageNet statistics.
         # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
         mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
@@ -459,11 +461,6 @@ class ParallelScheduler(Scheduler):
         Each recipient evaluates via their own kNN + Wundt curve.
         If interest > τ_D (domain_threshold), artifact enters the
         domain and recipient adopts the expression (3.4).
-
-        DEVIATION(paper 3.4): Recipient adopts expression +
-        updates current artifact on acceptance. Paper says
-        artifact enters domain but adoption semantics are
-        ambiguous — code makes the explicit choice to adopt.
         """
         if not messages:
             return []
@@ -537,30 +534,28 @@ class ParallelScheduler(Scheduler):
                 if len(self.domain) > self.max_domain_size:
                     self.domain.pop(0) # Remove oldest
                 
-                # DEVIATION(paper 3.4): Recipient adopts the
-                # shared expression as their current one.
-                # Paper: "artifact enters domain" but doesn't
-                # explicitly state recipient changes expression.
-                recipient.current_expression = artifact.content._copy()
-                recipient.current_interest = interest
-                recipient.current_artifact_id = artifact.id 
-                
-                # DEVIATION(paper 3.3.1): Uniqueness check —
-                # only add to kNN if expression string differs
-                # from last 5 entries. Prevents memory pollution
-                # from duplicate artifacts.
-                expr_str = artifact.content.to_string()
-                recent_exprs = [mem['expression'].to_string() for mem in recipient.artifact_memory[-5:]]
-                if expr_str not in recent_exprs:
-                    recipient.knn.add_feature_vectors(artifact.features.unsqueeze(0), self.step_count)
-                    recipient.artifact_memory.append({
-                        'id': artifact.id, 
-                        'expression': artifact.content, 
-                        'features': artifact.features,
-                        'creator_id': artifact.creator_id
-                    })
-
+                # DEVIATION(paper 3.4): Recipient adoption of the
+                # shared expression as current state is optional.
+                if self.adopt_shared_expression:
+                    recipient.current_expression = artifact.content._copy()
+                    recipient.current_interest = interest
+                    recipient.current_artifact_id = artifact.id
                 recipient.current_creator_id = artifact.creator_id
+
+            # Receiving implies exposure: update recipient memory
+            # even when the artifact is not accepted into domain.
+            # DEVIATION(paper 3.3.1): Uniqueness check only add
+            # to kNN if expression string differs from last 5.
+            expr_str = artifact.content.to_string()
+            recent_exprs = [mem['expression'].to_string() for mem in recipient.artifact_memory[-5:]]
+            if expr_str not in recent_exprs:
+                recipient.knn.add_feature_vectors(artifact.features.unsqueeze(0), self.step_count)
+                recipient.artifact_memory.append({
+                    'id': artifact.id,
+                    'expression': artifact.content,
+                    'features': artifact.features,
+                    'creator_id': artifact.creator_id
+                })
             
             interaction_results.append({
                 'accepted': accepted,
@@ -587,7 +582,7 @@ class ParallelScheduler(Scheduler):
         ResNet-18 features → kNN novelty → normalize → Wundt
         curve hedonic value → update cumulative interest (3.3).
 
-        DEVIATION(paper 3.3.1): Uniqueness check — compares
+        DEVIATION(paper 3.3.1): Uniqueness check which compares
         expression string against last 5 in memory before adding
         to kNN. Prevents duplicate features from diluting novelty.
         Not described in the paper.
@@ -661,7 +656,7 @@ class ParallelScheduler(Scheduler):
             agent.total_novelty_generated += normalized_novelty
             agent.total_interest_generated += interest
             
-            # DEVIATION(paper 3.3.1): Uniqueness check —
+            # DEVIATION(paper 3.3.1): Uniqueness check
             # last 5 expressions compared by string to prevent
             # duplicate features entering kNN memory.
             expr_str = artifact.content.to_string()
@@ -725,7 +720,6 @@ class ParallelScheduler(Scheduler):
                 or restart with random expression.
               - "Overwhelm" (high novelty): retreat to a known
                 high-interest artifact from hall of fame.
-            Developed in consultation with Saunders, 2025.
         """
         # ------------------------------------------------------------------
         # Pass 1: classify bored agents

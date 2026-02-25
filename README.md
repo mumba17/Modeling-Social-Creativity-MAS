@@ -12,7 +12,7 @@ Each simulation step follows a fixed pipeline (Algorithm 1):
 2. **Evaluate** — Artifacts are rendered to 32x32 images, passed through a ResNet-18 feature extractor, and scored for novelty via GPU-accelerated kNN.
 3. **Self-evaluate** — Normalized novelty is mapped to interest through the agent's personal Wundt curve.
 4. **Share** — Agents whose interest exceeds a dynamic threshold share with N random peers.
-5. **Interact** — Recipients evaluate received artifacts against their own memory; accepted artifacts enter the shared domain.
+5. **Interact** — Recipients evaluate received artifacts against their own memory; all seen shared artifacts are added to recipient memory (with duplicate filtering), accepted artifacts enter the shared domain, and recipient expression adoption is optional via CLI.
 6. **Boredom** — Agents with declining cumulative interest either explore the domain or retreat to known high-interest work.
 7. **Update thresholds** — System-wide sharing, acceptance, and boredom thresholds are recalculated from rolling percentile windows.
 
@@ -87,6 +87,11 @@ python main.py --feature_dims 64 --pca_calibration_samples 500
 python main.py --save_images --image_output_dir output/images
 ```
 
+**Enable recipient adoption** of accepted shared artifacts:
+```bash
+python main.py --adopt-shared-expression
+```
+
 **Custom logging directory** with a fixed seed:
 ```bash
 python main.py --log_dir runs/experiment_01 --seed 123
@@ -110,6 +115,7 @@ python main.py --num_agents 100 --num_steps 50 --time_it
 | `--pca_calibration_samples` | int | 500 | Calibration samples for PCA fitting |
 | `--distance_metric` | str | cosine | kNN distance metric (`cosine` or `euclidean`) |
 | `--boredom_mode` | str | extended | Boredom mechanism (`classic` or `extended`) |
+| `--adopt-shared-expression` | flag | off | Recipients adopt accepted shared artifacts as current expression (default keeps own expression) |
 | `--uniform_novelty_pref` | flag | off | Give all agents identical novelty preference (0.5) |
 | `--use_static_noise` | flag | off | Replace rendering with random noise (debug) |
 | `--save_images` | flag | off | Save rendered artifact PNGs |
@@ -138,7 +144,7 @@ Per-artifact event log with columns:
 | `evaluator_id` | Evaluating agent (`recipient_id` for `share`, `agent_id` for `generation`/`boredom_adoption`) |
 | `domain_size` | Size of shared domain at the time the event row is logged |
 | `sender_id` / `recipient_id` | For share events |
-| `accepted` | Whether the recipient adopted the artifact |
+| `accepted` | Whether the recipient accepted the artifact into the domain |
 | `parent1_id` / `parent2_id` | Parent artifact IDs (if bred) |
 
 ### agent_init.csv
@@ -173,11 +179,12 @@ Tracks per-agent novelty/interest, domain size, dynamic thresholds, and interact
 | `logger.py` | Thread-safe CSV, TensorBoard, and composite loggers |
 | `timing_utils.py` | Performance profiling decorator and statistics |
 
-# Happy simulating! For questions or issues, please open an issue on GitHub.
 
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
+
+### Happy simulating! For questions or issues, please open an issue on GitHub.
 
 ## Author
 

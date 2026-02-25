@@ -106,8 +106,8 @@ class ExpressionArtifactGenerator(ArtifactGenerator):
                 if new_expr.to_string() != current_expr_str:
                     break
             else:
-                # All attempts produced same expression — force
-                # high-mutation fallback (3x rate)
+                # All attempts produced same expression 
+                # force high-mutation fallback (3x rate)
                 new_expr = agent.current_expression._copy()
                 new_expr.mutate(rate=self.mutation_rate * 3, max_depth=agent.gen_depth)
 
@@ -190,6 +190,9 @@ def main():
                         choices=['classic', 'extended'],
                         help='DEVIATION(paper 3.4): "classic" matches paper; '
                              '"extended" adds hedonic retreat (default).')
+    parser.add_argument('--adopt-shared-expression', action='store_true',
+                        help='If set, recipients adopt accepted shared artifacts as current expression. '
+                             'Default: keep own current expression.')
     parser.add_argument('--save_images', action='store_true',
                         help='Save rendered artifact PNGs (debug).')
     parser.add_argument('--image_output_dir', type=str, default=None,
@@ -284,6 +287,7 @@ def main():
             pca_calibration_samples=args.pca_calibration_samples,
             distance_metric=args.distance_metric,
             boredom_mode=args.boredom_mode,
+            adopt_shared_expression=args.adopt_shared_expression,
             save_images=args.save_images,
             image_output_dir=image_output_dir
     )

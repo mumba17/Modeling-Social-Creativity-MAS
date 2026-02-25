@@ -37,7 +37,7 @@ class kNN:
         self.dtype = dtype if self.device.type == 'cuda' else torch.float32
         self.max_size = max_size
         
-        # Lazy-initialized circular buffer — allocated on first
+        # Lazy-initialized circular buffer; allocated on first
         # add_feature_vectors() call when feature_dim is known.
         self.memory_buffer = None 
         
@@ -96,7 +96,7 @@ class kNN:
             similarity_matrix = torch.matmul(queries_norm, all_memories_norm.T)
             # largest=True selects most-similar (nearest) neighbors
             use_largest = True
-        else:  # euclidean — paper-described metric (3.3.1)
+        else:  # euclidean - paper-described metric (3.3.1)
             # Pairwise L2: ||a-b||² = ||a||² + ||b||² - 2a·b
             q_sq = (queries ** 2).sum(dim=1, keepdim=True)
             m_sq = (all_memories ** 2).sum(dim=1, keepdim=True)
@@ -170,7 +170,7 @@ class kNN:
             novelty_scores = raw_novelty
         
         # Agents with ≤1 memory item can't compute meaningful
-        # novelty — default to 1.0 (maximally novel) so they
+        # novelty - default to 1.0 (maximally novel) so they
         # accept early artifacts and bootstrap their memory.
         novelty_scores = torch.where(valid_mem_sizes <= 1, torch.ones_like(novelty_scores), novelty_scores)
         

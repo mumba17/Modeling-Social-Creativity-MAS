@@ -3,8 +3,6 @@ Simulation Logging (Infrastructure)
 ====================================
 
 Concrete implementations of the `Logger` abstract base class.
-This module is infrastructure — it does not implement any
-algorithmic behavior from the paper.
 
 Thread-safety design:
     CSVLogger uses a producer/consumer queue with a dedicated

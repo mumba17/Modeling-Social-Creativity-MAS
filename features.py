@@ -4,7 +4,7 @@ Feature Extraction Module (3.3.2)
 
 Extracts visual features from generated artifacts using a pre-trained ResNet-18.
 Layer 2 is used as the feature extraction point because deeper layers
-(3, 4) suffer from feature homogenization on 32x32 inputs — the spatial
+(3, 4) suffer from feature homogenization on 32x32 inputs - the spatial
 resolution collapses and distinct images produce near-identical vectors,
 destroying novelty signal (3.3.2).
 
@@ -63,12 +63,12 @@ class FeatureExtractor(nn.Module):
             model.bn1,
             model.relu,
             model.layer1,
-            # Paper (3.3.2): Layer 2 is optimal — deeper layers
+            # Paper (3.3.2): Layer 2 is optimal - deeper layers
             # homogenize features on small images.
             model.layer2
         )
         
-        # Freeze all backbone parameters — we never train this
+        # Freeze all backbone parameters - we never train this
         for param in self.features.parameters():
             param.requires_grad = False
         

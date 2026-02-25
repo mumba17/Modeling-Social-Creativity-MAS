@@ -101,8 +101,8 @@ class Agent:
         alpha (float): Learning rate for updating average interest.
     """
     unique_id: int
-    knn: Any  # kNN instance — personal feature repository (3.3.1)
-    wundt: Any # WundtCurve instance — hedonic evaluator (3.3.4)
+    knn: Any  # kNN instance - personal feature repository (3.3.1)
+    wundt: Any # WundtCurve instance - hedonic evaluator (3.3.4)
     # Cumulative interest S_i, updated via EMA (3.4)
     average_interest: float = 0.0
     current_expression: Optional[ExpressionNode] = None
@@ -111,7 +111,7 @@ class Agent:
     current_interest: float = -1.0 
     # Personal artifact memory for breeding partners (3.2.2)
     artifact_memory: List[Dict] = field(default_factory=list) 
-    # Rolling evaluation histories — used by StatsTracker for
+    # Rolling evaluation histories - used by StatsTracker for
     # threshold computation (3.4)
     self_eval_history: List[float] = field(default_factory=list)
     other_eval_history: List[float] = field(default_factory=list)
@@ -149,7 +149,7 @@ class Agent:
             self.hall_of_fame = self.hall_of_fame[:self.max_fame_size]
 
 
-# DIFI: Interaction component — the scheduler orchestrates the
+# DIFI: Interaction component - the scheduler orchestrates the
 # flow of artifacts between agents (Field evaluation, 3.4).
 class Scheduler(abc.ABC):
     """
