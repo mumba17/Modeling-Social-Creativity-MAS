@@ -186,10 +186,10 @@ def main():
                         choices=['cosine', 'euclidean'],
                         help='kNN metric. DEVIATION(paper 3.3.1): '
                              'paper uses euclidean; code defaults to cosine.')
-    parser.add_argument('--boredom_mode', type=str, default='extended',
+    parser.add_argument('--boredom_mode', type=str, default='classic',
                         choices=['classic', 'extended'],
                         help='DEVIATION(paper 3.4): "classic" matches paper; '
-                             '"extended" adds hedonic retreat (default).')
+                             '"extended" adds hedonic retreat (experimental, WIP).')
     parser.add_argument('--adopt-shared-expression', action='store_true',
                         help='If set, recipients adopt accepted shared artifacts as current expression. '
                              'Default: keep own current expression.')

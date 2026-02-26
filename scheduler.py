@@ -176,7 +176,7 @@ class ParallelScheduler(Scheduler):
                  share_count: int = 5, uniform_novelty_pref: bool = False,
                  use_static_noise: bool = False, feature_dims: int = 0,
                  pca_calibration_samples: int = 500, distance_metric: str = 'cosine',
-                 boredom_mode: str = 'extended', adopt_shared_expression: bool = False,
+                 boredom_mode: str = 'classic', adopt_shared_expression: bool = False,
                  save_images: bool = False,
                  image_output_dir: str = None):
         """
