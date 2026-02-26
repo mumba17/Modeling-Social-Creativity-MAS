@@ -83,6 +83,8 @@ class kNN:
         Code: Defaults to cosine; Euclidean available via flag.
         """
         num_agents, _ = queries.shape
+        queries = torch.nan_to_num(queries, nan=0.0, posinf=1.0, neginf=-1.0)
+        all_memories = torch.nan_to_num(all_memories, nan=0.0, posinf=1.0, neginf=-1.0)
         total_memory_size = all_memories.shape[0]
         device = queries.device
 
@@ -105,7 +107,6 @@ class kNN:
             similarity_matrix = -(q_sq + m_sq.T - 2 * torch.matmul(queries, all_memories.T))
             use_largest = True
 
-        agent_indices = torch.arange(num_agents, device=device).unsqueeze(1)
         memory_indices_broadcast = torch.arange(total_memory_size, device=device).unsqueeze(0)
         
         start_indices = memory_indices[:, 0].unsqueeze(1)
@@ -115,29 +116,29 @@ class kNN:
         
         masked_similarity = torch.where(valid_memory_mask, similarity_matrix, -1e9)
 
-        max_k = agent_ks.max().item()
+        max_k = int(torch.clamp(agent_ks.max(), min=1).item())
         
         valid_mem_sizes = memory_indices[:, 1] - memory_indices[:, 0]
         
         if not (valid_mem_sizes > 0).any():
             return torch.ones(num_agents, device=device)
         
-        min_memory_size = valid_mem_sizes[valid_mem_sizes > 0].min().item() if (valid_mem_sizes > 0).any() else 1
-
-        actual_k = min(max_k, min_memory_size)
+        actual_k = min(max_k, total_memory_size)
         if actual_k <= 0:
-             return torch.zeros(num_agents, device=device)
+            return torch.ones(num_agents, device=device)
 
         top_k_similarities, _ = torch.topk(masked_similarity, k=actual_k, dim=1, largest=use_largest)
 
+        effective_ks_long = torch.minimum(agent_ks, torch.clamp(valid_mem_sizes, min=0))
+        effective_ks_long = torch.clamp(effective_ks_long, min=1)
         k_indices = torch.arange(actual_k, device=device).unsqueeze(0)
-        agent_k_mask = k_indices < agent_ks.unsqueeze(1)
+        agent_k_mask = k_indices < effective_ks_long.unsqueeze(1)
 
         masked_top_k_similarities = torch.where(agent_k_mask, top_k_similarities, 0.0)
         sum_of_similarities = masked_top_k_similarities.sum(dim=1)
         
         # Mean of top-k similarities
-        effective_k = torch.clamp(agent_ks, min=1).float()
+        effective_k = effective_ks_long.float()
         
         if metric == 'cosine':
             mean_similarities = sum_of_similarities / effective_k
@@ -173,6 +174,7 @@ class kNN:
         # novelty - default to 1.0 (maximally novel) so they
         # accept early artifacts and bootstrap their memory.
         novelty_scores = torch.where(valid_mem_sizes <= 1, torch.ones_like(novelty_scores), novelty_scores)
+        novelty_scores = torch.nan_to_num(novelty_scores, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return novelty_scores
 
@@ -188,6 +190,8 @@ class kNN:
         message_to_agent_map.
         """
         num_queries, _ = queries.shape
+        queries = torch.nan_to_num(queries, nan=0.0, posinf=1.0, neginf=-1.0)
+        all_memories = torch.nan_to_num(all_memories, nan=0.0, posinf=1.0, neginf=-1.0)
         total_memory_size = all_memories.shape[0]
         device = queries.device
 
@@ -215,28 +219,29 @@ class kNN:
         masked_similarity = torch.where(valid_memory_mask, similarity_matrix, -1e9)
         
         query_ks = agent_ks[message_to_agent_map]
-        max_k_in_batch = query_ks.max().item()
+        max_k_in_batch = int(torch.clamp(query_ks.max(), min=1).item())
 
         recipient_mem_sizes = end_indices.squeeze(1) - start_indices.squeeze(1)
         
         if not (recipient_mem_sizes > 0).any():
             return torch.ones(num_queries, device=device)
         
-        min_memory_size_in_batch = recipient_mem_sizes[recipient_mem_sizes > 0].min().item() if (recipient_mem_sizes > 0).any() else 1
-        
-        actual_k = min(max_k_in_batch, min_memory_size_in_batch)
+        actual_k = min(max_k_in_batch, total_memory_size)
         if actual_k <= 0:
-            return torch.zeros(num_queries, device=device)
+            return torch.ones(num_queries, device=device)
 
         top_k_similarities, _ = torch.topk(masked_similarity, k=actual_k, dim=1, largest=use_largest)
 
+        effective_ks_long = torch.minimum(query_ks, torch.clamp(recipient_mem_sizes, min=0))
+        effective_ks_long = torch.clamp(effective_ks_long, min=1)
+
         k_indices = torch.arange(actual_k, device=device).unsqueeze(0)
-        agent_k_mask = k_indices < query_ks.unsqueeze(1)
+        agent_k_mask = k_indices < effective_ks_long.unsqueeze(1)
 
         masked_top_k = torch.where(agent_k_mask, top_k_similarities, 0.0)
         sum_of_similarities = masked_top_k.sum(dim=1)
 
-        effective_k = torch.clamp(query_ks, min=1).float()
+        effective_k = effective_ks_long.float()
         
         if metric == 'cosine':
             mean_similarities = sum_of_similarities / effective_k
@@ -262,6 +267,7 @@ class kNN:
             novelty_scores = raw_novelty
             
         novelty_scores = torch.where(recipient_mem_sizes <= 1, torch.ones_like(novelty_scores), novelty_scores)
+        novelty_scores = torch.nan_to_num(novelty_scores, nan=0.0, posinf=1.0, neginf=-1.0)
 
         return novelty_scores
 

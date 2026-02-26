@@ -96,12 +96,12 @@ class StatsTracker:
 
     def record_self_interest(self, interest_value):
         """Record interest from an agent evaluating their own artifact."""
-        if not np.isnan(interest_value):
+        if np.isfinite(interest_value):
             self.self_interest_window.append(interest_value)
     
     def record_other_interest(self, interest_value):
         """Record interest from an agent evaluating a received artifact."""
-        if not np.isnan(interest_value):
+        if np.isfinite(interest_value):
             self.other_interest_window.append(interest_value)
 
     def update_novelty_stats(self, new_novelty_tensor, step_count, recalc_interval=3):
@@ -111,16 +111,16 @@ class StatsTracker:
         Recalculation schedule: every 3 steps, skip first 5.
         """
         novelty_list = new_novelty_tensor.detach().cpu().numpy().flatten().tolist()
-        # Filter out NaN values to prevent poisoning the percentile window
-        novelty_list = [v for v in novelty_list if not np.isnan(v)]
+        # Filter out non-finite values to prevent poisoning the percentile window
+        novelty_list = [v for v in novelty_list if np.isfinite(v)]
         self.novelty_window.extend(novelty_list)
         
         # 3.3.3: recalculate bounds every recalc_interval steps,
         # skip first 5 steps to accumulate a meaningful baseline.
         if step_count >= 5 and step_count % recalc_interval == 0 and len(self.novelty_window) > 100:
             novelty_array = np.array(self.novelty_window)
-            # Guard against any residual NaN in the window
-            novelty_array = novelty_array[~np.isnan(novelty_array)]
+            # Guard against any residual non-finite values in the window
+            novelty_array = novelty_array[np.isfinite(novelty_array)]
             if len(novelty_array) < 2:
                 return
             self.p1 = np.percentile(novelty_array, 1)
@@ -135,8 +135,14 @@ class StatsTracker:
         Maps raw kNN distance onto [0,1] for Wundt curve input.
         Formula: clip((x - P1) / (P99 - P1), 0, 1)
         """
+        if not np.isfinite(raw_score):
+            return np.nan
+
         numerator = raw_score - self.p1
         denominator = self.p99 - self.p1
+        if not np.isfinite(denominator) or denominator == 0:
+            return np.nan
+
         normalized = numerator / denominator
         return np.clip(normalized, 0.0, 1.0)
 
@@ -159,7 +165,7 @@ class StatsTracker:
         
         # Boredom threshold (τ_B): trigger boredom if S_i below
         cumulative_interests = [a.average_interest for a in all_agents
-                               if not np.isnan(a.average_interest)]
+                               if np.isfinite(a.average_interest)]
         if cumulative_interests:
             self.cumulative_interest_window.extend(cumulative_interests)
             self.boredom_thresh = np.percentile(list(self.cumulative_interest_window), 10)
@@ -247,6 +253,27 @@ class ParallelScheduler(Scheduler):
         self.self_threshold = self.stats.self_thresh
         self.domain_threshold = self.stats.domain_thresh
         self.boredom_threshold = self.stats.boredom_thresh
+
+    def _sanitize_tensor(self, tensor: torch.Tensor, source: str,
+                         agent_id: int = None, artifact: Artifact = None,
+                         creator_id: int = None, evaluator_id: int = None) -> torch.Tensor:
+        if tensor is None:
+            return tensor
+
+        finite_mask = torch.isfinite(tensor)
+        if bool(finite_mask.all()):
+            return tensor
+
+        return torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+
+    def _sanitize_scalar(self, value: float, fallback: float, source: str,
+                         agent_id: int = None, artifact: Artifact = None,
+                         creator_id: int = None, evaluator_id: int = None,
+                         trigger_novelty: float = None) -> float:
+        if np.isfinite(value):
+            return float(value)
+
+        return float(fallback) if np.isfinite(fallback) else 0.0
 
     @time_it
     def _initialize_agents(self) -> List[Agent]:
@@ -401,6 +428,7 @@ class ParallelScheduler(Scheduler):
         
         # 1. Generate directly to GPU Tensor (N, 3, H, W) range [0, 1]
         image_tensor_batch = self.image_generator.generate_batch(expressions, use_amp=self.use_amp)
+        image_tensor_batch = self._sanitize_tensor(image_tensor_batch, source='evaluation.image_generator.output')
 
         if image_tensor_batch.shape[0] == 0:
              return []
@@ -418,11 +446,14 @@ class ParallelScheduler(Scheduler):
         std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         
         normalized_batch = (image_tensor_batch - mean) / std
+        normalized_batch = self._sanitize_tensor(normalized_batch, source='evaluation.normalized_batch')
 
         # 3. Extract Features
         with self._gpu_stream_context():
             with torch.no_grad():
                 features_batch = self.feature_extractor(normalized_batch).detach()
+
+        features_batch = self._sanitize_tensor(features_batch, source='evaluation.features_batch')
         
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
@@ -478,12 +509,14 @@ class ParallelScheduler(Scheduler):
         with self._gpu_stream_context():
             query_features_list = [msg['artifact'].features for msg in messages]
             query_batch = torch.stack(query_features_list)
+            query_batch = self._sanitize_tensor(query_batch, source='interaction.query_batch')
             
             # Prepare memory tensors (same as individual evaluation)
             memory_tensors = [agent.knn.feature_vectors for agent in self.agents]
             feature_dim = query_batch.shape[1]
             memory_tensors = [mem if mem.numel() > 0 else torch.empty(0, feature_dim, device=self.device) for mem in memory_tensors]
             consolidated_memories = torch.cat(memory_tensors, dim=0)
+            consolidated_memories = self._sanitize_tensor(consolidated_memories, source='interaction.consolidated_memories')
             
             memory_indices = torch.zeros(self.num_agents, 2, dtype=torch.long, device=self.device)
             agent_ks = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
@@ -509,6 +542,8 @@ class ParallelScheduler(Scheduler):
                 novelty_scores_tensor = kNN.batch_evaluate_novelty_for_messages(
                     query_batch, message_to_agent_map, consolidated_memories, memory_indices, agent_ks, self.distance_metric
                 )
+
+            novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, source='interaction.novelty_scores_tensor.after_knn')
             
             # DEVIATION(paper 3.3.3): Only self-generated
             # artifacts define the novelty landscape.
@@ -527,7 +562,30 @@ class ParallelScheduler(Scheduler):
             raw_novelty = novelty_scores[i]
             # Use same normalization as generation phase
             normalized_novelty = self._normalize_novelty(raw_novelty)
+
+            normalized_novelty = self._sanitize_scalar(
+                normalized_novelty,
+                fallback=0.5,
+                source='interaction.scalar.normalized_novelty',
+                agent_id=recipient.unique_id,
+                artifact=artifact,
+                creator_id=artifact.creator_id,
+                evaluator_id=recipient.unique_id,
+                trigger_novelty=float(raw_novelty) if np.isfinite(raw_novelty) else None,
+            )
+
             interest = recipient.wundt.hedonic_value(normalized_novelty, experience=recipient.knn.current_size)
+            fallback_interest = recipient.wundt.hedonic_value(0.5, experience=recipient.knn.current_size)
+            interest = self._sanitize_scalar(
+                interest,
+                fallback=fallback_interest,
+                source='interaction.scalar.interest',
+                agent_id=recipient.unique_id,
+                artifact=artifact,
+                creator_id=artifact.creator_id,
+                evaluator_id=recipient.unique_id,
+                trigger_novelty=normalized_novelty,
+            )
             
             self.stats.record_other_interest(interest)
             
@@ -573,6 +631,7 @@ class ParallelScheduler(Scheduler):
             })
 
             self.logger.log_event('share', {
+                'agent_id': message['sender_id'],
                 'step': self.step_count, 'sender_id': message['sender_id'], 'recipient_id': recipient.unique_id,
                 'artifact_id': artifact.id, 'expression': artifact.content.to_string(),
                 'evaluated_novelty': normalized_novelty, 'evaluated_interest': interest,
@@ -602,6 +661,7 @@ class ParallelScheduler(Scheduler):
         with self._gpu_stream_context():
             query_features_list = [art.features for art in evaluated_artifacts]
             query_batch = torch.stack(query_features_list)
+            query_batch = self._sanitize_tensor(query_batch, source='individual.query_batch')
 
             memory_tensors = [agent.knn.feature_vectors for agent in self.agents]
             
@@ -609,6 +669,7 @@ class ParallelScheduler(Scheduler):
             memory_tensors = [mem if mem.numel() > 0 else torch.empty(0, feature_dim, device=self.device) for mem in memory_tensors]
 
             consolidated_memories = torch.cat(memory_tensors, dim=0)
+            consolidated_memories = self._sanitize_tensor(consolidated_memories, source='individual.consolidated_memories')
             
             memory_indices = torch.zeros(self.num_agents, 2, dtype=torch.long, device=self.device)
             agent_ks = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
@@ -631,6 +692,8 @@ class ParallelScheduler(Scheduler):
                 novelty_scores_tensor = kNN.batch_evaluate_novelty_for_agents(
                     query_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric
                 )
+
+            novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, source='individual.novelty_scores_tensor.after_knn')
             
             self.stats.update_novelty_stats(novelty_scores_tensor, self.step_count)
 
@@ -644,25 +707,29 @@ class ParallelScheduler(Scheduler):
 
             raw_novelty = novelty_scores[i]
             normalized_novelty = self._normalize_novelty(raw_novelty)
-            interest = agent.wundt.hedonic_value(normalized_novelty, experience=agent.knn.current_size)
+            normalized_novelty = self._sanitize_scalar(
+                normalized_novelty,
+                fallback=0.5,
+                source='individual.scalar.normalized_novelty',
+                agent_id=agent.unique_id,
+                artifact=artifact,
+                creator_id=artifact.creator_id,
+                evaluator_id=agent.unique_id,
+                trigger_novelty=float(raw_novelty) if np.isfinite(raw_novelty) else None,
+            )
 
-            # Guard: if novelty or interest is NaN (e.g. from degenerate
-            # features), skip state updates to avoid poisoning the agent's
-            # EMA and kNN memory.  Artifact is still logged with NaN so
-            # the event is traceable, but agent state is preserved.
-            if np.isnan(normalized_novelty) or np.isnan(interest):
-                artifact.novelty = normalized_novelty
-                artifact.interest = interest
-                self.logger.log_event('generation', {
-                    'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': artifact.id,
-                    'expression': artifact.content.to_string(), 'novelty': normalized_novelty, 'interest': interest,
-                    'adopted': False,
-                    'parent1_id': artifact.parent1_id, 'parent2_id': artifact.parent2_id,
-                    'creator_id': artifact.creator_id,
-                    'evaluator_id': agent.unique_id,
-                    'domain_size': len(self.domain)
-                })
-                continue
+            interest = agent.wundt.hedonic_value(normalized_novelty, experience=agent.knn.current_size)
+            fallback_interest = agent.wundt.hedonic_value(0.5, experience=agent.knn.current_size)
+            interest = self._sanitize_scalar(
+                interest,
+                fallback=fallback_interest,
+                source='individual.scalar.interest',
+                agent_id=agent.unique_id,
+                artifact=artifact,
+                creator_id=artifact.creator_id,
+                evaluator_id=agent.unique_id,
+                trigger_novelty=normalized_novelty,
+            )
 
             self.stats.record_self_interest(interest)
             
@@ -1005,7 +1072,8 @@ class ParallelScheduler(Scheduler):
         """
         Normalizes a raw novelty score to the [0, 1] range using the StatsTracker.
         """
-        return self.stats.get_normalized_novelty(raw_novelty)
+        normalized = self.stats.get_normalized_novelty(raw_novelty)
+        return normalized
 
     def update_system_thresholds(self):
         """
