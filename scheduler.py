@@ -96,11 +96,13 @@ class StatsTracker:
 
     def record_self_interest(self, interest_value):
         """Record interest from an agent evaluating their own artifact."""
-        self.self_interest_window.append(interest_value)
+        if not np.isnan(interest_value):
+            self.self_interest_window.append(interest_value)
     
     def record_other_interest(self, interest_value):
         """Record interest from an agent evaluating a received artifact."""
-        self.other_interest_window.append(interest_value)
+        if not np.isnan(interest_value):
+            self.other_interest_window.append(interest_value)
 
     def update_novelty_stats(self, new_novelty_tensor, step_count, recalc_interval=3):
         """
@@ -109,12 +111,18 @@ class StatsTracker:
         Recalculation schedule: every 3 steps, skip first 5.
         """
         novelty_list = new_novelty_tensor.detach().cpu().numpy().flatten().tolist()
+        # Filter out NaN values to prevent poisoning the percentile window
+        novelty_list = [v for v in novelty_list if not np.isnan(v)]
         self.novelty_window.extend(novelty_list)
         
         # 3.3.3: recalculate bounds every recalc_interval steps,
         # skip first 5 steps to accumulate a meaningful baseline.
         if step_count >= 5 and step_count % recalc_interval == 0 and len(self.novelty_window) > 100:
             novelty_array = np.array(self.novelty_window)
+            # Guard against any residual NaN in the window
+            novelty_array = novelty_array[~np.isnan(novelty_array)]
+            if len(novelty_array) < 2:
+                return
             self.p1 = np.percentile(novelty_array, 1)
             self.p99 = np.percentile(novelty_array, 99)
             
@@ -150,7 +158,8 @@ class StatsTracker:
             self.domain_thresh = np.percentile(list(self.other_interest_window), 80)
         
         # Boredom threshold (τ_B): trigger boredom if S_i below
-        cumulative_interests = [a.average_interest for a in all_agents]
+        cumulative_interests = [a.average_interest for a in all_agents
+                               if not np.isnan(a.average_interest)]
         if cumulative_interests:
             self.cumulative_interest_window.extend(cumulative_interests)
             self.boredom_thresh = np.percentile(list(self.cumulative_interest_window), 10)
@@ -636,7 +645,25 @@ class ParallelScheduler(Scheduler):
             raw_novelty = novelty_scores[i]
             normalized_novelty = self._normalize_novelty(raw_novelty)
             interest = agent.wundt.hedonic_value(normalized_novelty, experience=agent.knn.current_size)
-            
+
+            # Guard: if novelty or interest is NaN (e.g. from degenerate
+            # features), skip state updates to avoid poisoning the agent's
+            # EMA and kNN memory.  Artifact is still logged with NaN so
+            # the event is traceable, but agent state is preserved.
+            if np.isnan(normalized_novelty) or np.isnan(interest):
+                artifact.novelty = normalized_novelty
+                artifact.interest = interest
+                self.logger.log_event('generation', {
+                    'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': artifact.id,
+                    'expression': artifact.content.to_string(), 'novelty': normalized_novelty, 'interest': interest,
+                    'adopted': False,
+                    'parent1_id': artifact.parent1_id, 'parent2_id': artifact.parent2_id,
+                    'creator_id': artifact.creator_id,
+                    'evaluator_id': agent.unique_id,
+                    'domain_size': len(self.domain)
+                })
+                continue
+
             self.stats.record_self_interest(interest)
             
             # --- Update Agent State ---
@@ -886,7 +913,8 @@ class ParallelScheduler(Scheduler):
             })
 
             # Adopt only if better than current
-            if interest > agent.current_interest:
+            adopted = interest > agent.current_interest
+            if adopted:
                 agent.current_expression  = domain_artifact.content._copy()
                 agent.current_interest    = interest
                 agent.current_artifact_id = domain_artifact.id
@@ -895,6 +923,11 @@ class ParallelScheduler(Scheduler):
             self.logger.log_event('boredom_adoption', {
                 'step':            self.step_count,
                 'agent_id':        agent.unique_id,
+                'artifact_id':     domain_artifact.id,
+                'expression':      domain_artifact.content.to_string(),
+                'novelty':         normalized_novelty,
+                'interest':        interest,
+                'adopted':         adopted,
                 'source':          'domain_classic',
                 'trigger_novelty': getattr(agent, 'current_novelty', 0.5),
                 'creator_id':      domain_artifact.creator_id,
@@ -916,6 +949,10 @@ class ParallelScheduler(Scheduler):
         boredom (explore).
         """
         current_nov = getattr(agent, 'current_novelty', 0.5)
+        # Recover from NaN-poisoned average_interest so the agent
+        # can rejoin the normal evaluation cycle after boredom.
+        if np.isnan(agent.average_interest):
+            agent.average_interest = 0.0
         parent_expr = None
         source_creator_id = agent.unique_id
         source_type = "random"
@@ -952,6 +989,11 @@ class ParallelScheduler(Scheduler):
         self.logger.log_event('boredom_adoption', {
             'step': self.step_count,
             'agent_id': agent.unique_id,
+            'artifact_id': getattr(agent, 'current_artifact_id', None),
+            'expression': new_expr.to_string(),
+            'novelty': current_nov,
+            'interest': 0.0,
+            'adopted': True,
             'source': source_type,
             'trigger_novelty': current_nov,
             'creator_id': source_creator_id,

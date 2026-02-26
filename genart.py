@@ -180,7 +180,9 @@ def q_conjugate(q: QuaternionTensor) -> QuaternionTensor: return q.conjugate()
 def q_normalize(q: QuaternionTensor) -> QuaternionTensor: return q.normalize()
 def q_rotate45(q: QuaternionTensor) -> QuaternionTensor: return q.rotate(torch.pi/4)
 def q_mod2(q: QuaternionTensor) -> QuaternionTensor: return q.modulo(2.0)
-def q_spiral(q: QuaternionTensor) -> QuaternionTensor: return q * QuaternionTensor(torch.exp(q.data * 0.5))
+def q_spiral(q: QuaternionTensor) -> QuaternionTensor:
+    clamped_data = torch.clamp(q.data, -10.0, 10.0)
+    return QuaternionTensor(clamped_data * torch.exp(clamped_data * 0.5))
 def q_wave(q: QuaternionTensor) -> QuaternionTensor: return q_sin(q) * q_cos(q.rotate(torch.pi/3))
 def q_blend(x: QuaternionTensor, y: QuaternionTensor) -> QuaternionTensor:
     t = 0.5 * (1 + torch.sin(x.norm_squared()))
