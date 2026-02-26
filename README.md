@@ -20,7 +20,7 @@ Each simulation step follows a fixed pipeline (Algorithm 1):
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/your-username/Modeling-Social-Creativity.git
+git clone https://github.com/mumba17/Modeling-Social-Creativity-MAS.git
 cd Modeling-Social-Creativity
 ```
 
@@ -184,8 +184,8 @@ Tracks per-agent novelty/interest, domain size, dynamic thresholds, and interact
 
 MIT License. See [LICENSE](LICENSE) for details.
 
-### Happy simulating! For questions or issues, please open an issue on GitHub.
+### Happy simulating!
 
 ## Author
-
-[Luuk Motz]
+[luukmotz.nl]: https://luukmotz.nl
+[github.com/mumba17]: https://github.com/mumba17
