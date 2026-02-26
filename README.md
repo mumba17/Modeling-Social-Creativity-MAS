@@ -187,5 +187,20 @@ MIT License. See [LICENSE](LICENSE) for details.
 ### Happy simulating!
 
 ## Author
-[luukmotz.nl]: https://luukmotz.nl
-[github.com/mumba17]: https://github.com/mumba17
+[Luuk Motz](https://luukmotz.nl) | [Github](https://github.com/mumba17)
+
+## Citation
+
+If you use this code or build on the underlying research, please cite the original thesis:
+```bibtex
+@thesis{motz2025socialcreativity,
+  author     = {Luuk Motz},
+  title      = {Modeling Social Creativity with Large-Scale Multi-Agent Systems and Emergent Properties of Collective Creative Processes},
+  school     = {Leiden Institute of Advanced Computer Science (LIACS), Leiden University},
+  year       = {2025},
+  month      = {January},
+  type       = {Bachelor's Thesis},
+  supervisor = {Rob Saunders, Tessa Verhoef},
+  url        = {https://theses.liacs.nl/pdf/2024-2025-MotzLLuuk.pdf}
+}
+```
