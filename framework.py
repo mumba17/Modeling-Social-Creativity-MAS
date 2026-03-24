@@ -120,7 +120,7 @@ class Agent:
     # Paper: No mechanism for retaining top artifacts.
     # Code: Keeps top-N artifacts by interest for hedonic retreat
     #       in the extended boredom mode.
-    hall_of_fame: List[tuple] = field(default_factory=list)
+    hall_of_fame: List[Any] = field(default_factory=list)
     max_fame_size: int = 10
 
     # Parameters
@@ -132,7 +132,17 @@ class Agent:
     # Exponential moving alpha decay for cumulative interest (3.4)
     alpha: float = 0.35 
 
-    def update_hall_of_fame(self, artifact_content: Any, interest: float):
+    def _hall_of_fame_interest(self, entry: Any) -> float:
+        """
+        Returns interest for both legacy tuple entries and structured entries.
+        """
+        if isinstance(entry, dict):
+            return float(entry.get('interest', 0.0))
+        if isinstance(entry, (tuple, list)) and len(entry) >= 1:
+            return float(entry[0])
+        return 0.0
+
+    def update_hall_of_fame(self, artifact_content: Any, interest: float, creator_id: Optional[int] = None):
         """
         Updates the agent's 'Hall of Fame' with high-interest artifacts.
         Keeps only the top N items sorted by interest.
@@ -140,11 +150,15 @@ class Agent:
         DEVIATION(paper 3.4): Hall of fame not described in paper.
         Used by extended boredom mode for hedonic retreat.
         """
-        entry = (interest, artifact_content)
+        entry = {
+            'interest': float(interest),
+            'expression': artifact_content,
+            'creator_id': creator_id,
+        }
         self.hall_of_fame.append(entry)
 
         # Sort by interest descending and keep top N
-        self.hall_of_fame.sort(key=lambda x: x[0], reverse=True)
+        self.hall_of_fame.sort(key=self._hall_of_fame_interest, reverse=True)
         if len(self.hall_of_fame) > self.max_fame_size:
             self.hall_of_fame = self.hall_of_fame[:self.max_fame_size]
 

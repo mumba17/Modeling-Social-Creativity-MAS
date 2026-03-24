@@ -735,7 +735,7 @@ class ParallelScheduler(Scheduler):
             
             # --- Update Agent State ---
             # DEVIATION(paper 3.4): Hall of fame update not in paper.
-            agent.update_hall_of_fame(artifact.content, interest)
+            agent.update_hall_of_fame(artifact.content, interest, creator_id=artifact.creator_id)
             # Cumulative interest EMA (3.4): S_i = α·S_i + (1-α)·h_i
             agent.average_interest = agent.alpha * agent.average_interest + (1 - agent.alpha) * interest
             agent.self_eval_history.append(interest)
@@ -968,16 +968,23 @@ class ParallelScheduler(Scheduler):
             features           = features_batch[i]           # (feat_dim,)
             raw_novelty        = novelty_scores[i].item()
             normalized_novelty = self._normalize_novelty(raw_novelty)
-            interest           = agent.wundt.hedonic_value(normalized_novelty)
+            interest           = agent.wundt.hedonic_value(
+                normalized_novelty,
+                experience=agent.knn.current_size
+            )
 
-            # Add to memory regardless
-            agent.knn.add_feature_vectors(features.unsqueeze(0), self.step_count)
-            agent.artifact_memory.append({
-                'id':         domain_artifact.id,
-                'expression': domain_artifact.content,
-                'features':   features,
-                'creator_id': domain_artifact.creator_id,
-            })
+            # Keep boredom memory behavior consistent with other phases:
+            # only add unique expressions compared to the latest history.
+            expr_str = domain_artifact.content.to_string()
+            recent_exprs = [mem['expression'].to_string() for mem in agent.artifact_memory[-5:]]
+            if expr_str not in recent_exprs:
+                agent.knn.add_feature_vectors(features.unsqueeze(0), self.step_count)
+                agent.artifact_memory.append({
+                    'id':         domain_artifact.id,
+                    'expression': domain_artifact.content,
+                    'features':   features,
+                    'creator_id': domain_artifact.creator_id,
+                })
 
             # Adopt only if better than current
             adopted = interest > agent.current_interest
@@ -1031,8 +1038,18 @@ class ParallelScheduler(Scheduler):
         if is_overwhelmed and agent.hall_of_fame:
             # Hedonic retreat: return to best-known artifact
             entry = agent.hall_of_fame[0]
-            parent_expr = entry[1]
-            source_creator_id = agent.current_creator_id if agent.current_creator_id is not None else agent.unique_id
+            if isinstance(entry, dict):
+                parent_expr = entry.get('expression')
+                source_creator_id = entry.get('creator_id')
+            elif isinstance(entry, (tuple, list)) and len(entry) >= 2:
+                parent_expr = entry[1]
+                # Legacy tuple entries have no creator_id, fallback to prior behavior.
+                source_creator_id = agent.current_creator_id
+
+            if parent_expr is None:
+                parent_expr = genart.ExpressionNode.create_random(depth=agent.gen_depth)
+            if source_creator_id is None:
+                source_creator_id = agent.unique_id
             source_type = "hedonic_retreat"
         elif self.domain and random.random() < 0.7:
             # True boredom: sample domain for fresh inspiration
@@ -1048,6 +1065,10 @@ class ParallelScheduler(Scheduler):
         
         new_expr = parent_expr._copy()
         new_expr.mutate(rate=0.1, max_depth=agent.gen_depth)
+
+        # Intentionally no immediate kNN update in extended mode.
+        # The mutated expression is evaluated and enters memory
+        # in the regular generation/evaluation pipeline next step.
         
         agent.current_expression = new_expr
         agent.current_interest = 0.0
