@@ -190,9 +190,6 @@ def main():
                         choices=['classic', 'extended'],
                         help='DEVIATION(paper 3.4): "classic" matches paper; '
                              '"extended" adds hedonic retreat (experimental, WIP).')
-    parser.add_argument('--adopt-shared-expression', action='store_true',
-                        help='If set, recipients adopt accepted shared artifacts as current expression. '
-                             'Default: keep own current expression.')
     parser.add_argument('--save_images', action='store_true',
                         help='Save rendered artifact PNGs (debug).')
     parser.add_argument('--image_output_dir', type=str, default=None,
@@ -287,7 +284,6 @@ def main():
             pca_calibration_samples=args.pca_calibration_samples,
             distance_metric=args.distance_metric,
             boredom_mode=args.boredom_mode,
-            adopt_shared_expression=args.adopt_shared_expression,
             save_images=args.save_images,
             image_output_dir=image_output_dir
     )

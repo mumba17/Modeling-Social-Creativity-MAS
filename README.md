@@ -87,11 +87,6 @@ python main.py --feature_dims 64 --pca_calibration_samples 500
 python main.py --save_images --image_output_dir output/images
 ```
 
-**Enable recipient adoption** of accepted shared artifacts:
-```bash
-python main.py --adopt-shared-expression
-```
-
 **Custom logging directory** with a fixed seed:
 ```bash
 python main.py --log_dir runs/experiment_01 --seed 123
@@ -115,7 +110,6 @@ python main.py --num_agents 100 --num_steps 50 --time_it
 | `--pca_calibration_samples` | int | 500 | Calibration samples for PCA fitting |
 | `--distance_metric` | str | cosine | kNN distance metric (`cosine` or `euclidean`) |
 | `--boredom_mode` | str | classic | Boredom mechanism (`classic` or `extended`) - Extended is still a WIP and experimental | 
-| `--adopt-shared-expression` | flag | off | Recipients adopt accepted shared artifacts as current expression (default keeps own expression) |
 | `--uniform_novelty_pref` | flag | off | Give all agents identical novelty preference (0.5) |
 | `--use_static_noise` | flag | off | Replace rendering with random noise (debug) |
 | `--save_images` | flag | off | Save rendered artifact PNGs |

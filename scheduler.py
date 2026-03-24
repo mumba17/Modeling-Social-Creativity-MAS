@@ -182,7 +182,7 @@ class ParallelScheduler(Scheduler):
                  share_count: int = 5, uniform_novelty_pref: bool = False,
                  use_static_noise: bool = False, feature_dims: int = 0,
                  pca_calibration_samples: int = 500, distance_metric: str = 'cosine',
-                 boredom_mode: str = 'classic', adopt_shared_expression: bool = False,
+                 boredom_mode: str = 'classic',
                  save_images: bool = False,
                  image_output_dir: str = None):
         """
@@ -202,7 +202,6 @@ class ParallelScheduler(Scheduler):
         self.uniform_novelty_pref = uniform_novelty_pref
         self.distance_metric = distance_metric
         self.boredom_mode = boredom_mode
-        self.adopt_shared_expression = adopt_shared_expression
         self.save_images = save_images
         self.image_output_dir = image_output_dir
 
@@ -373,9 +372,96 @@ class ParallelScheduler(Scheduler):
         return nullcontext()
 
     @time_it
+    def refresh_current_interest_phase(self):
+        """
+        Algorithm 1, step 0: Re-evaluate h_i for current artifact a_i.
+
+        The paper re-computes each agent's interest in their current
+        artifact every step because the agent's kNN memory has grown,
+        making the same artifact less novel over time. This prevents
+        current_interest from acting as a frozen high-water mark.
+
+        Uses cached current_features (set alongside current_expression
+        at every adoption point) to skip image re-rendering.
+        """
+        active = [a for a in self.agents if a.current_features is not None]
+        if not active:
+            return
+
+        with self._gpu_stream_context():
+            query_batch = torch.stack([a.current_features for a in active])
+            query_batch = self._sanitize_tensor(query_batch, source='refresh.query_batch')
+
+            feature_dim = query_batch.shape[1]
+            memory_tensors = [
+                agent.knn.feature_vectors
+                if agent.knn.feature_vectors.numel() > 0
+                else torch.empty(0, feature_dim, device=self.device)
+                for agent in active
+            ]
+            consolidated_memories = torch.cat(memory_tensors, dim=0)
+            consolidated_memories = self._sanitize_tensor(
+                consolidated_memories, source='refresh.consolidated_memories'
+            )
+
+            n_active = len(active)
+            memory_indices = torch.zeros(n_active, 2, dtype=torch.long, device=self.device)
+            agent_ks = torch.zeros(n_active, dtype=torch.long, device=self.device)
+            current_index = 0
+
+            for i, agent in enumerate(active):
+                mem_size = agent.knn.feature_vectors.shape[0]
+                if mem_size > 0:
+                    memory_indices[i] = torch.tensor(
+                        [current_index, current_index + mem_size], device=self.device
+                    )
+                    current_index += mem_size
+                else:
+                    memory_indices[i] = torch.tensor([-1, -1], device=self.device)
+                agent_ks[i] = agent.knn.k
+
+            novelty_scores_tensor = kNN.batch_evaluate_novelty_for_agents(
+                query_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric
+            )
+            novelty_scores_tensor = self._sanitize_tensor(
+                novelty_scores_tensor, source='refresh.novelty_scores'
+            )
+
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+        novelty_scores = novelty_scores_tensor.cpu().numpy()
+
+        for i, agent in enumerate(active):
+            raw_novelty = novelty_scores[i]
+            normalized_novelty = self._normalize_novelty(raw_novelty)
+            normalized_novelty = self._sanitize_scalar(
+                normalized_novelty, fallback=0.5,
+                source='refresh.normalized_novelty',
+                agent_id=agent.unique_id,
+            )
+
+            refreshed_interest = agent.wundt.hedonic_value(
+                normalized_novelty, experience=agent.knn.current_size
+            )
+            refreshed_interest = self._sanitize_scalar(
+                refreshed_interest,
+                fallback=agent.wundt.hedonic_value(0.5, experience=agent.knn.current_size),
+                source='refresh.interest',
+                agent_id=agent.unique_id,
+            )
+            agent.current_interest = refreshed_interest
+            agent.current_novelty = normalized_novelty
+
+    @time_it
     def step(self):
         """
         Executes one full step of Algorithm 1.
+
+        DEVIATION(paper Algorithm 1): Paper processes inbox before
+        generation (received artifacts influence next generation
+        immediately). Batched architecture requires all sharing and
+        receiving to happen in separate passes, introducing a one-step
+        lag for received artifact influence.
 
         Phase ordering:
           1. Generate     → generation_phase()
@@ -386,6 +472,7 @@ class ParallelScheduler(Scheduler):
           6. Boredom      → boredom_phase()
           7. Thresholds   → update_system_thresholds()
         """
+        self.refresh_current_interest_phase()
         generated_artifacts = self.generation_phase()
         evaluated_artifacts = self.evaluation_phase(generated_artifacts)
         self.individual_evaluation_phase(evaluated_artifacts)
@@ -500,7 +587,14 @@ class ParallelScheduler(Scheduler):
         Algorithm 1, step 4: Receive & evaluate shared artifacts.
         Each recipient evaluates via their own kNN + Wundt curve.
         If interest > τ_D (domain_threshold), artifact enters the
-        domain and recipient adopts the expression (3.4).
+        domain.
+
+        Algorithm 1 additionally adopts the received artifact as
+        current state when h^n_i > h_i, independent of domain entry.
+
+        DEVIATION(paper Algorithm 1): Sender feedback not implemented.
+        Paper: sender receives h^n_i back from recipient. No current
+        agent behavior depends on received feedback.
         """
         if not messages:
             return []
@@ -600,13 +694,14 @@ class ParallelScheduler(Scheduler):
                 # Keep domain from growing infinitely
                 if len(self.domain) > self.max_domain_size:
                     self.domain.pop(0) # Remove oldest
-                
-                # DEVIATION(paper 3.4): Recipient adoption of the
-                # shared expression as current state is optional.
-                if self.adopt_shared_expression:
-                    recipient.current_expression = artifact.content._copy()
-                    recipient.current_interest = interest
-                    recipient.current_artifact_id = artifact.id
+
+            # Algorithm 1: adopt if h^n_i > h_i (independent of domain check)
+            adopted_received = interest > recipient.current_interest
+            if adopted_received:
+                recipient.current_expression = artifact.content._copy()
+                recipient.current_interest = interest
+                recipient.current_features = artifact.features
+                recipient.current_artifact_id = artifact.id
                 recipient.current_creator_id = artifact.creator_id
 
             # Receiving implies exposure: update recipient memory
@@ -636,6 +731,7 @@ class ParallelScheduler(Scheduler):
                 'artifact_id': artifact.id, 'expression': artifact.content.to_string(),
                 'evaluated_novelty': normalized_novelty, 'evaluated_interest': interest,
                 'accepted': accepted,
+                'adopted': adopted_received,
                 'creator_id': artifact.creator_id,
                 'evaluator_id': recipient.unique_id,
                 'domain_size': len(self.domain)
@@ -736,9 +832,6 @@ class ParallelScheduler(Scheduler):
             # --- Update Agent State ---
             # DEVIATION(paper 3.4): Hall of fame update not in paper.
             agent.update_hall_of_fame(artifact.content, interest, creator_id=artifact.creator_id)
-            # Cumulative interest EMA (3.4): S_i = α·S_i + (1-α)·h_i
-            agent.average_interest = agent.alpha * agent.average_interest + (1 - agent.alpha) * interest
-            agent.self_eval_history.append(interest)
             
             # Store previous interest for adoption comparison
             previous_interest = agent.current_interest
@@ -773,10 +866,15 @@ class ParallelScheduler(Scheduler):
             adopted = False
             if agent.current_expression is None or interest > previous_interest:
                 agent.current_expression = artifact.content
+                agent.current_features = artifact.features
                 agent.current_interest = interest
                 agent.current_artifact_id = artifact.id
                 agent.current_creator_id = artifact.creator_id
                 adopted = True
+
+            # S_i = αS_i + (1-α)h_i where h_i is post-adoption interest
+            agent.average_interest = agent.alpha * agent.average_interest + (1 - agent.alpha) * agent.current_interest
+            agent.self_eval_history.append(agent.current_interest)
 
             self.logger.log_event('generation', {
                 'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': artifact.id,
@@ -986,10 +1084,12 @@ class ParallelScheduler(Scheduler):
                     'creator_id': domain_artifact.creator_id,
                 })
 
-            # Adopt only if better than current
+            # Algorithm 1 boredom adoption compares retrieved interest
+            # against the agent's current h_i.
             adopted = interest > agent.current_interest
             if adopted:
                 agent.current_expression  = domain_artifact.content._copy()
+                agent.current_features    = features
                 agent.current_interest    = interest
                 agent.current_artifact_id = domain_artifact.id
                 agent.current_creator_id  = domain_artifact.creator_id
@@ -1071,6 +1171,7 @@ class ParallelScheduler(Scheduler):
         # in the regular generation/evaluation pipeline next step.
         
         agent.current_expression = new_expr
+        agent.current_features = None
         agent.current_interest = 0.0
         agent.current_creator_id = source_creator_id
         

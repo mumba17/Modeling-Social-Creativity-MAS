@@ -106,6 +106,7 @@ class Agent:
     # Cumulative interest S_i, updated via EMA (3.4)
     average_interest: float = 0.0
     current_expression: Optional[ExpressionNode] = None
+    current_features: Optional[torch.Tensor] = None
     current_artifact_id: Optional[int] = None
     current_creator_id: Optional[int] = None
     current_interest: float = -1.0 
