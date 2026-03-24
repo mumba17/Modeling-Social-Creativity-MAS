@@ -114,7 +114,7 @@ class Agent:
     # Personal artifact memory for breeding partners (3.2.2)
     # Capped to prevent unbounded growth; only recent artifacts
     # matter for breeding selection and uniqueness checks.
-    artifact_memory: List[Dict] = field(default_factory=lambda: deque(maxlen=200)) 
+    artifact_memory: List[Dict] = field(default_factory=lambda: deque(maxlen=5000)) 
     
     # DEVIATION(paper 3.4): Hall of fame is not described in paper.
     # Paper: No mechanism for retaining top artifacts.
