@@ -9,6 +9,7 @@ extensibility.
 """
 
 import abc
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 import numpy as np
@@ -111,11 +112,9 @@ class Agent:
     current_creator_id: Optional[int] = None
     current_interest: float = -1.0 
     # Personal artifact memory for breeding partners (3.2.2)
-    artifact_memory: List[Dict] = field(default_factory=list) 
-    # Rolling evaluation histories - used by StatsTracker for
-    # threshold computation (3.4)
-    self_eval_history: List[float] = field(default_factory=list)
-    other_eval_history: List[float] = field(default_factory=list)
+    # Capped to prevent unbounded growth; only recent artifacts
+    # matter for breeding selection and uniqueness checks.
+    artifact_memory: List[Dict] = field(default_factory=lambda: deque(maxlen=200)) 
     
     # DEVIATION(paper 3.4): Hall of fame is not described in paper.
     # Paper: No mechanism for retaining top artifacts.
@@ -127,8 +126,6 @@ class Agent:
     # Parameters
     gen_depth: int = 5
     # Preferred novelty ~ N(0.5, 0.155), clipped [0,1] (3.3.4)
-    # Still testing this as there's a behaviour where novelty=1.0 might not be interpreted correctly
-    # as they nearly always return 0.0 interest, which might not be the intended behaviour, especially in a cold start
     preferred_novelty: float = 0.5
     # Exponential moving alpha decay for cumulative interest (3.4)
     alpha: float = 0.35 

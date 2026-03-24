@@ -243,7 +243,6 @@ class ParallelScheduler(Scheduler):
         # Domain: shared artifact repository (2.2 DIFI model)
         # Paper: no curation, artifacts remain indefinitely.
         self.domain: List[Artifact] = []
-        self.max_domain_size = 1000000000
 
         # Initialize Stats Tracker
         self.stats = StatsTracker()
@@ -691,9 +690,6 @@ class ParallelScheduler(Scheduler):
                 
                 # Artifact enters the domain (3.4)
                 self.domain.append(artifact)
-                # Keep domain from growing infinitely
-                if len(self.domain) > self.max_domain_size:
-                    self.domain.pop(0) # Remove oldest
 
             # Algorithm 1: adopt if h^n_i > h_i (independent of domain check)
             adopted_received = interest > recipient.current_interest
@@ -709,7 +705,7 @@ class ParallelScheduler(Scheduler):
             # DEVIATION(paper 3.3.1): Uniqueness check only add
             # to kNN if expression string differs from last 5.
             expr_str = artifact.content.to_string()
-            recent_exprs = [mem['expression'].to_string() for mem in recipient.artifact_memory[-5:]]
+            recent_exprs = [mem['expression'].to_string() for mem in list(recipient.artifact_memory)[-5:]]
             if expr_str not in recent_exprs:
                 recipient.knn.add_feature_vectors(artifact.features.unsqueeze(0), self.step_count)
                 recipient.artifact_memory.append({
@@ -847,7 +843,7 @@ class ParallelScheduler(Scheduler):
             # last 5 expressions compared by string to prevent
             # duplicate features entering kNN memory.
             expr_str = artifact.content.to_string()
-            recent_exprs = [mem['expression'].to_string() for mem in agent.artifact_memory[-5:]]
+            recent_exprs = [mem['expression'].to_string() for mem in list(agent.artifact_memory)[-5:]]
             is_unique = expr_str not in recent_exprs
             
             if is_unique:
@@ -872,9 +868,15 @@ class ParallelScheduler(Scheduler):
                 agent.current_creator_id = artifact.creator_id
                 adopted = True
 
-            # S_i = αS_i + (1-α)h_i where h_i is post-adoption interest
+            # DEVIATION: S_i update ordering.
+            # Paper: S_i = αS_i + (1-α)h_i runs after inbox processing,
+            #   so adopted received artifacts influence S_i immediately.
+            
+            # Code: S_i updates here (before interaction_phase), so
+            #   artifacts adopted from inbox only affect S_i next step.
+            #   Mitigated by refresh_current_interest_phase which
+            #   recalculates h_i each step anyway.
             agent.average_interest = agent.alpha * agent.average_interest + (1 - agent.alpha) * agent.current_interest
-            agent.self_eval_history.append(agent.current_interest)
 
             self.logger.log_event('generation', {
                 'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': artifact.id,
@@ -1074,7 +1076,7 @@ class ParallelScheduler(Scheduler):
             # Keep boredom memory behavior consistent with other phases:
             # only add unique expressions compared to the latest history.
             expr_str = domain_artifact.content.to_string()
-            recent_exprs = [mem['expression'].to_string() for mem in agent.artifact_memory[-5:]]
+            recent_exprs = [mem['expression'].to_string() for mem in list(agent.artifact_memory)[-5:]]
             if expr_str not in recent_exprs:
                 agent.knn.add_feature_vectors(features.unsqueeze(0), self.step_count)
                 agent.artifact_memory.append({
@@ -1174,6 +1176,7 @@ class ParallelScheduler(Scheduler):
         agent.current_features = None
         agent.current_interest = 0.0
         agent.current_creator_id = source_creator_id
+        agent.current_artifact_id = None
         
         self.logger.log_event('boredom_adoption', {
             'step': self.step_count,

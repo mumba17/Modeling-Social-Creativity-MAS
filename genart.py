@@ -148,7 +148,7 @@ def q_log(q: QuaternionTensor) -> QuaternionTensor:
     return QuaternionTensor(torch.log(safe_data))
 def q_sqrt(q: QuaternionTensor) -> QuaternionTensor:
     return QuaternionTensor(torch.sqrt(torch.abs(q.data)))
-def q_tan(q: QuaternionTensor) -> QuaternionTensor: return q_sin(q) * q_cos(q).conjugate()
+def q_tan(q: QuaternionTensor) -> QuaternionTensor: return q_sin(q) / q_cos(q)
 def q_abs(q: QuaternionTensor) -> QuaternionTensor: return QuaternionTensor(torch.abs(q.data))
 def q_floor(q: QuaternionTensor) -> QuaternionTensor: return q.floor()
 def q_power(q: QuaternionTensor) -> QuaternionTensor:
@@ -320,11 +320,6 @@ class ExpressionEncoder:
         self.NON_TERMINAL_OPS = NON_TERMINAL_OPS
 
 DEFAULT_ENCODER = ExpressionEncoder(include_floor_mod2=True)
-
-def configure_expression_operators(enable_floor_mod2: bool = False):
-    """Configure which optional operators are available for expression trees."""
-    global DEFAULT_ENCODER
-    DEFAULT_ENCODER = ExpressionEncoder(include_floor_mod2=enable_floor_mod2)
 
 # --- Expression Tree (CPU-based, 3.2.2) ---
 # Trees are manipulated on CPU (breeding, mutation) and only

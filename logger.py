@@ -46,10 +46,13 @@ class CSVLogger(Logger):
         self._thread = threading.Thread(target=self._process_queue, daemon=True)
         self._stop_event = threading.Event()
 
-        # Open the file and write the header
-        with open(self.log_file_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-            writer.writeheader()
+        # Open the file once and keep the handle for the lifetime
+        # of this logger. Avoids repeated open/close syscalls in
+        # the writer thread (previously one open per row).
+        self._file = open(self.log_file_path, 'w', newline='')
+        self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames)
+        self._writer.writeheader()
+        self._file.flush()
 
         self._thread.start()
 
@@ -61,15 +64,14 @@ class CSVLogger(Logger):
             try:
                 # Wait for an item to appear in the queue, with a timeout
                 log_data = self._queue.get(timeout=0.1)
-
-                with open(self.log_file_path, 'a', newline='') as f:
-                    writer = csv.DictWriter(f, fieldnames=self.fieldnames)
-                    writer.writerow(log_data)
-
+                self._writer.writerow(log_data)
                 self._queue.task_done()
             except queue.Empty:
                 # Timeout occurred, loop again to check stop_event
                 continue
+            # Periodic flush so data is recoverable on crash
+            if self._queue.empty():
+                self._file.flush()
 
     def log_event(self, event_type: str, data: Dict[str, Any]):
         """
@@ -113,6 +115,11 @@ class CSVLogger(Logger):
 
         # Wait for the thread to terminate
         self._thread.join()
+
+        # Close the persistent file handle
+        if self._file and not self._file.closed:
+            self._file.flush()
+            self._file.close()
 
 class TensorBoardLogger(Logger):
     """

@@ -83,18 +83,23 @@ class TimingStats:
         self.current_step_times.clear()
         self.call_counts.clear()
 
-ENABLE_TIMING = True
+ENABLE_TIMING = False
 
 def time_it(func):
     """
     Decorator to measure and record function execution time.
 
+    Checks ENABLE_TIMING at runtime so the flag can be set after
+    import but before the simulation loop starts. When disabled,
+    the overhead is a single boolean check per call.
+    
     It handles recursion correctly by only timing the outermost call.
     """
-    if not ENABLE_TIMING:
-        return func
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
+        if not ENABLE_TIMING:
+            return func(*args, **kwargs)
+        
         key = func.__qualname__
         _recursion_depths[key] += 1
         

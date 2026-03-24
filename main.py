@@ -21,7 +21,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 
 import argparse
-import concurrent.futures
 import random
 import time
 from datetime import datetime
@@ -295,6 +294,8 @@ def main():
     print(f"Logs will be saved in: {log_dir}")
     
     if args.time_it:
+        import timing_utils
+        timing_utils.ENABLE_TIMING = True
         timing_stats = TimingStats()
         print("Function timing is ENABLED.")
 
