@@ -304,7 +304,7 @@ class ParallelScheduler(Scheduler):
             query_batch = self._sanitize_tensor(torch.stack([a.current_features for a in active]), 'refresh.query_batch')
             global_buffer, current_sizes, agent_ks = self._prepare_knn_batch_state(active, query_batch.shape[1], self.device)
             global_buffer = self._sanitize_tensor(global_buffer, 'refresh.global_buffer')
-            novelty_scores_tensor = self._sanitize_tensor(kNN.batch_evaluate_novelty_for_agents(query_batch, global_buffer, current_sizes, agent_ks, self.distance_metric), 'refresh.novelty_scores')
+            novelty_scores_tensor = self._sanitize_tensor(kNN.batch_evaluate_novelty_for_agents(query_batch, global_buffer, current_sizes, agent_ks), 'refresh.novelty_scores')
 
             p1, p99 = self.stats.p1, self.stats.p99
             denom = p99 - p1 if (p99 - p1) != 0 else 1e-6
@@ -398,9 +398,9 @@ class ParallelScheduler(Scheduler):
             message_to_agent_map = torch.tensor([msg['recipient_id'] for msg in messages], device=self.device, dtype=torch.long)
 
             if self.multi_gpu and query_batch.shape[0] >= len(self.device_ids):
-                novelty_scores_tensor = self._parallel_apply_custom(kNN.batch_evaluate_novelty_for_messages, query_batch, message_to_agent_map, global_buffer, current_sizes, agent_ks, self.distance_metric)
+                novelty_scores_tensor = self._parallel_apply_custom(kNN.batch_evaluate_novelty_for_messages, query_batch, message_to_agent_map, global_buffer, current_sizes, agent_ks)
             else:
-                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_messages(query_batch, message_to_agent_map, global_buffer, current_sizes, agent_ks, self.distance_metric)
+                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_messages(query_batch, message_to_agent_map, global_buffer, current_sizes, agent_ks)
             novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, 'interaction.novelty_scores_tensor.after_knn')
 
             p1, p99 = self.stats.p1, self.stats.p99
@@ -501,9 +501,9 @@ class ParallelScheduler(Scheduler):
             global_buffer = self._sanitize_tensor(global_buffer, 'individual.global_buffer')
 
             if self.multi_gpu and query_batch.shape[0] >= len(self.device_ids):
-                novelty_scores_tensor = self._parallel_apply_custom(kNN.batch_evaluate_novelty_for_agents, query_batch, global_buffer, current_sizes, agent_ks, self.distance_metric)
+                novelty_scores_tensor = self._parallel_apply_custom(kNN.batch_evaluate_novelty_for_agents, query_batch, global_buffer, current_sizes, agent_ks)
             else:
-                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_agents(query_batch, global_buffer, current_sizes, agent_ks, self.distance_metric)
+                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_agents(query_batch, global_buffer, current_sizes, agent_ks)
             
             novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, 'individual.novelty_scores_tensor.after_knn')
             self.stats.update_novelty_stats(novelty_scores_tensor, self.step_count)
@@ -590,123 +590,123 @@ class ParallelScheduler(Scheduler):
         if staged_gen_logs:
             self.logger.log_events_batch('generation', staged_gen_logs)
 
-        @time_it
-        def boredom_phase(self):
-            """Triggers exploratory actions for agents experiencing decreasing baseline interest levels."""
-            classic_agents, chosen_artifacts = [], []
-            for agent in self.agents:
-                if agent.average_interest >= self.boredom_threshold: continue
-                if not self.domain: continue
-                classic_agents.append(agent)
-                chosen_artifacts.append(random.choice(self.domain))
+    @time_it
+    def boredom_phase(self):
+        """Triggers exploratory actions for agents experiencing decreasing baseline interest levels."""
+        classic_agents, chosen_artifacts = [], []
+        for agent in self.agents:
+            if agent.average_interest >= self.boredom_threshold: continue
+            if not self.domain: continue
+            classic_agents.append(agent)
+            chosen_artifacts.append(random.choice(self.domain))
 
-            if not classic_agents: return
+        if not classic_agents: return
 
-            cached_features, uncached_indices, uncached_artifacts = [], [] ,[]
-            for idx, art in enumerate(chosen_artifacts):
-                if art.features is not None: cached_features.append((idx, art.features))
-                else:
-                    uncached_indices.append(idx)
-                    uncached_artifacts.append(art)
+        cached_features, uncached_indices, uncached_artifacts = [], [] ,[]
+        for idx, art in enumerate(chosen_artifacts):
+            if art.features is not None: cached_features.append((idx, art.features))
+            else:
+                uncached_indices.append(idx)
+                uncached_artifacts.append(art)
 
-            if cached_features: feature_dim = cached_features[0][1].shape[0]
-            elif uncached_artifacts:
-                _probe_batch = self.image_generator.generate_batch([uncached_artifacts[0].content], use_amp=self.use_amp)
-                if _probe_batch.shape[0] == 0: return
+        if cached_features: feature_dim = cached_features[0][1].shape[0]
+        elif uncached_artifacts:
+            _probe_batch = self.image_generator.generate_batch([uncached_artifacts[0].content], use_amp=self.use_amp)
+            if _probe_batch.shape[0] == 0: return
+            with self._gpu_stream_context(), torch.no_grad():
+                _f = self.feature_extractor((_probe_batch - self.imagenet_mean) / self.imagenet_std).detach()
+            if self.device.type == 'cuda': torch.cuda.synchronize()
+            feature_dim = _f.shape[1]
+            uncached_artifacts[0].features = _f[0].clone()
+            cached_features.append((uncached_indices[0], _f[0].clone()))
+            uncached_indices, uncached_artifacts = uncached_indices[1:], uncached_artifacts[1:]
+        else: return
+
+        uncached_feature_map = {}
+        if uncached_artifacts:
+            image_tensor_batch = self.image_generator.generate_batch([art.content for art in uncached_artifacts], use_amp=self.use_amp)
+            if image_tensor_batch.shape[0] > 0:
+                normalized_batch = (image_tensor_batch - self.imagenet_mean) / self.imagenet_std
                 with self._gpu_stream_context(), torch.no_grad():
-                    _f = self.feature_extractor((_probe_batch - self.imagenet_mean) / self.imagenet_std).detach()
+                    rendered_features = self.feature_extractor(normalized_batch).detach()
                 if self.device.type == 'cuda': torch.cuda.synchronize()
-                feature_dim = _f.shape[1]
-                uncached_artifacts[0].features = _f[0].clone()
-                cached_features.append((uncached_indices[0], _f[0].clone()))
-                uncached_indices, uncached_artifacts = uncached_indices[1:], uncached_artifacts[1:]
-            else: return
+                for j, (orig_idx, art) in enumerate(zip(uncached_indices, uncached_artifacts)):
+                    art.features = rendered_features[j].clone()
+                    uncached_feature_map[orig_idx] = rendered_features[j].clone()
 
-            uncached_feature_map = {}
-            if uncached_artifacts:
-                image_tensor_batch = self.image_generator.generate_batch([art.content for art in uncached_artifacts], use_amp=self.use_amp)
-                if image_tensor_batch.shape[0] > 0:
-                    normalized_batch = (image_tensor_batch - self.imagenet_mean) / self.imagenet_std
-                    with self._gpu_stream_context(), torch.no_grad():
-                        rendered_features = self.feature_extractor(normalized_batch).detach()
-                    if self.device.type == 'cuda': torch.cuda.synchronize()
-                    for j, (orig_idx, art) in enumerate(zip(uncached_indices, uncached_artifacts)):
-                        art.features = rendered_features[j].clone()
-                        uncached_feature_map[orig_idx] = rendered_features[j].clone()
+        features_list = [None] * len(classic_agents)
+        for orig_idx, feat in cached_features: features_list[orig_idx] = feat
+        for orig_idx, feat in uncached_feature_map.items(): features_list[orig_idx] = feat
 
-            features_list = [None] * len(classic_agents)
-            for orig_idx, feat in cached_features: features_list[orig_idx] = feat
-            for orig_idx, feat in uncached_feature_map.items(): features_list[orig_idx] = feat
+        valid = [(i, f) for i, f in enumerate(features_list) if f is not None]
+        if not valid: return
+        if len(valid) < len(classic_agents):
+            keep_idx = [i for i, _ in valid]
+            classic_agents, chosen_artifacts, features_list = [classic_agents[i] for i in keep_idx], [chosen_artifacts[i] for i in keep_idx], [f for _, f in valid]
 
-            valid = [(i, f) for i, f in enumerate(features_list) if f is not None]
-            if not valid: return
-            if len(valid) < len(classic_agents):
-                keep_idx = [i for i, _ in valid]
-                classic_agents, chosen_artifacts, features_list = [classic_agents[i] for i in keep_idx], [chosen_artifacts[i] for i in keep_idx], [f for _, f in valid]
+        features_batch = torch.stack(features_list)
+        consolidated_memories, memory_indices, agent_ks = self._prepare_knn_batch_state(classic_agents, features_batch.shape[1], self.device)
+        novelty_scores = kNN.batch_evaluate_novelty_for_agents(features_batch, consolidated_memories, memory_indices, agent_ks)
 
-            features_batch = torch.stack(features_list)
-            consolidated_memories, memory_indices, agent_ks = self._prepare_knn_batch_state(classic_agents, features_batch.shape[1], self.device)
-            novelty_scores = kNN.batch_evaluate_novelty_for_agents(features_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric)
+        p1, p99 = self.stats.p1, self.stats.p99
+        denom = p99 - p1 if (p99 - p1) != 0 else 1e-6
+        normalized_novelty_tensor = torch.clamp((novelty_scores - p1) / denom, 0.0, 1.0)
+        
+        bored_agent_ids_tensor = torch.tensor([a.unique_id for a in classic_agents], device=self.device, dtype=torch.long)
+        interest_scores_tensor = WundtCurve.batch_hedonic_value(
+            normalized_novelty_tensor,
+            self.agent_reward_means[bored_agent_ids_tensor], self.agent_reward_stds[bored_agent_ids_tensor],
+            self.agent_punish_means[bored_agent_ids_tensor], self.agent_punish_stds[bored_agent_ids_tensor],
+            self.agent_alphas[bored_agent_ids_tensor]
+        )
 
-            p1, p99 = self.stats.p1, self.stats.p99
-            denom = p99 - p1 if (p99 - p1) != 0 else 1e-6
-            normalized_novelty_tensor = torch.clamp((novelty_scores - p1) / denom, 0.0, 1.0)
-            
-            bored_agent_ids_tensor = torch.tensor([a.unique_id for a in classic_agents], device=self.device, dtype=torch.long)
-            interest_scores_tensor = WundtCurve.batch_hedonic_value(
-                normalized_novelty_tensor,
-                self.agent_reward_means[bored_agent_ids_tensor], self.agent_reward_stds[bored_agent_ids_tensor],
-                self.agent_punish_means[bored_agent_ids_tensor], self.agent_punish_stds[bored_agent_ids_tensor],
-                self.agent_alphas[bored_agent_ids_tensor]
-            )
+        normalized_novelties = normalized_novelty_tensor.cpu().numpy()
+        interest_scores = interest_scores_tensor.cpu().numpy()
 
-            normalized_novelties = normalized_novelty_tensor.cpu().numpy()
-            interest_scores = interest_scores_tensor.cpu().numpy()
+        boredom_agent_ids = []
+        boredom_ptrs = []
+        boredom_features = []
+        staged_boredom_logs = []
 
-            boredom_agent_ids = []
-            boredom_ptrs = []
-            boredom_features = []
-            staged_boredom_logs = []
+        for i, (agent, domain_artifact) in enumerate(zip(classic_agents, chosen_artifacts)):
+            features = features_batch[i]
+            normalized_novelty = float(normalized_novelties[i])
+            interest = float(interest_scores[i])
 
-            for i, (agent, domain_artifact) in enumerate(zip(classic_agents, chosen_artifacts)):
-                features = features_batch[i]
-                normalized_novelty = float(normalized_novelties[i])
-                interest = float(interest_scores[i])
+            artifact_expr_str = domain_artifact.expr_str
+            if artifact_expr_str not in [mem['expr_str'] for mem in list(agent.artifact_memory)[-5:]]:
+                boredom_agent_ids.append(agent.unique_id)
+                boredom_ptrs.append(agent.knn.ptr)
+                boredom_features.append(features)
 
-                artifact_expr_str = domain_artifact.expr_str
-                if artifact_expr_str not in [mem['expr_str'] for mem in list(agent.artifact_memory)[-5:]]:
-                    boredom_agent_ids.append(agent.unique_id)
-                    boredom_ptrs.append(agent.knn.ptr)
-                    boredom_features.append(features)
-
-                    agent.artifact_memory.append({
-                        'id': domain_artifact.id, 'expression': domain_artifact.content, 'expr_str': artifact_expr_str, 'creator_id': domain_artifact.creator_id
-                    })
-                    agent.knn.ptr = (agent.knn.ptr + 1) % self.max_memory_size
-                    agent.knn.current_size = min(agent.knn.current_size + 1, self.max_memory_size)
-
-                adopted = interest > agent.current_interest
-                if adopted:
-                    agent.current_expression = domain_artifact.content._copy()
-                    agent.current_features, agent.current_interest, agent.current_artifact_id, agent.current_creator_id = features.clone(), interest, domain_artifact.id, domain_artifact.creator_id
-                    agent.current_expr_str = artifact_expr_str
-
-                staged_boredom_logs.append({
-                    'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': domain_artifact.id, 'expression': artifact_expr_str,
-                    'novelty': normalized_novelty, 'interest': interest, 'adopted': adopted, 'source': 'domain_classic', 'trigger_novelty': getattr(agent, 'current_novelty', 0.5),
-                    'creator_id': domain_artifact.creator_id, 'evaluator_id': agent.unique_id, 'domain_size': len(self.domain)
+                agent.artifact_memory.append({
+                    'id': domain_artifact.id, 'expression': domain_artifact.content, 'expr_str': artifact_expr_str, 'creator_id': domain_artifact.creator_id
                 })
+                agent.knn.ptr = (agent.knn.ptr + 1) % self.max_memory_size
+                agent.knn.current_size = min(agent.knn.current_size + 1, self.max_memory_size)
 
-            if boredom_agent_ids:
-                with torch.no_grad():
-                    stacked_boredom_feats = torch.stack(boredom_features)
-                    normalized_boredom_feats = torch.nn.functional.normalize(stacked_boredom_feats, p=2, dim=1)
-                    gpu_boredom_agents = torch.tensor(boredom_agent_ids, dtype=torch.long, device=self.device)
-                    gpu_boredom_ptrs = torch.tensor(boredom_ptrs, dtype=torch.long, device=self.device)
-                    self.global_memory_buffer[gpu_boredom_agents, gpu_boredom_ptrs, :] = normalized_boredom_feats
+            adopted = interest > agent.current_interest
+            if adopted:
+                agent.current_expression = domain_artifact.content._copy()
+                agent.current_features, agent.current_interest, agent.current_artifact_id, agent.current_creator_id = features.clone(), interest, domain_artifact.id, domain_artifact.creator_id
+                agent.current_expr_str = artifact_expr_str
 
-            if staged_boredom_logs:
-                self.logger.log_events_batch('boredom_adoption', staged_boredom_logs)
+            staged_boredom_logs.append({
+                'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': domain_artifact.id, 'expression': artifact_expr_str,
+                'novelty': normalized_novelty, 'interest': interest, 'adopted': adopted, 'source': 'domain_classic', 'trigger_novelty': getattr(agent, 'current_novelty', 0.5),
+                'creator_id': domain_artifact.creator_id, 'evaluator_id': agent.unique_id, 'domain_size': len(self.domain)
+            })
+
+        if boredom_agent_ids:
+            with torch.no_grad():
+                stacked_boredom_feats = torch.stack(boredom_features)
+                normalized_boredom_feats = torch.nn.functional.normalize(stacked_boredom_feats, p=2, dim=1)
+                gpu_boredom_agents = torch.tensor(boredom_agent_ids, dtype=torch.long, device=self.device)
+                gpu_boredom_ptrs = torch.tensor(boredom_ptrs, dtype=torch.long, device=self.device)
+                self.global_memory_buffer[gpu_boredom_agents, gpu_boredom_ptrs, :] = normalized_boredom_feats
+
+        if staged_boredom_logs:
+            self.logger.log_events_batch('boredom_adoption', staged_boredom_logs)
 
     @time_it
     def _normalize_novelty(self, raw_novelty: float) -> float:
@@ -725,40 +725,40 @@ class ParallelScheduler(Scheduler):
                 if len(agent.self_interest_window) > 10:
                     agent.self_threshold = np.percentile(list(agent.self_interest_window), 80)
 
-        def _log_step_metrics(self, interaction_results: List[Dict]):
-            """Collects step analytics across the agent population and logs the values."""
-            avg_accepted_interest, avg_rejected_interest, accepted_count, rejected_count = 0, 0, 0, 0
-            if interaction_results:
-                accepted_interests = [r['interest'] for r in interaction_results if r['accepted']]
-                rejected_interests = [r['interest'] for r in interaction_results if not r['accepted']]
-                accepted_count, rejected_count = len(accepted_interests), len(rejected_interests)
-                if accepted_interests: avg_accepted_interest = sum(accepted_interests) / accepted_count
-                if rejected_interests: avg_rejected_interest = sum(rejected_interests) / rejected_count
+    def _log_step_metrics(self, interaction_results: List[Dict]):
+        """Collects step analytics across the agent population and logs the values."""
+        avg_accepted_interest, avg_rejected_interest, accepted_count, rejected_count = 0, 0, 0, 0
+        if interaction_results:
+            accepted_interests = [r['interest'] for r in interaction_results if r['accepted']]
+            rejected_interests = [r['interest'] for r in interaction_results if not r['accepted']]
+            accepted_count, rejected_count = len(accepted_interests), len(rejected_interests)
+            if accepted_interests: avg_accepted_interest = sum(accepted_interests) / accepted_count
+            if rejected_interests: avg_rejected_interest = sum(rejected_interests) / rejected_count
 
-            avg_knn_size = sum([a.knn.feature_vectors.shape[0] for a in self.agents]) / self.num_agents
-            avg_current_interest = sum(a.current_interest for a in self.agents) / self.num_agents
-            avg_average_interest = sum(a.average_interest for a in self.agents) / self.num_agents
-            avg_current_novelty = sum(getattr(a, 'current_novelty', 0.0) for a in self.agents) / self.num_agents
+        avg_knn_size = sum([a.knn.feature_vectors.shape[0] for a in self.agents]) / self.num_agents
+        avg_current_interest = sum(a.current_interest for a in self.agents) / self.num_agents
+        avg_average_interest = sum(a.average_interest for a in self.agents) / self.num_agents
+        avg_current_novelty = sum(getattr(a, 'current_novelty', 0.0) for a in self.agents) / self.num_agents
 
-            self.logger.log_event('step_end', {
-                'step': self.step_count, 'domain_size': len(self.domain), 'self_threshold': self.self_threshold,
-                'domain_threshold': self.domain_threshold, 'boredom_threshold': self.boredom_threshold,
-                'avg_accepted_interest': avg_accepted_interest, 'avg_rejected_interest': avg_rejected_interest,
-                'accepted_count': accepted_count, 'rejected_count': rejected_count, 'avg_knn_size': avg_knn_size,
-                'avg_current_interest': avg_current_interest, 'avg_average_interest': avg_average_interest, 'avg_current_novelty': avg_current_novelty,
-                'total_self_evals': sum(a.num_self_evals for a in self.agents), 'total_other_evals': sum(a.num_other_evals for a in self.agents),
-                'total_shares': sum(a.num_shares for a in self.agents), 'total_domain_adoptions': sum(a.num_domain_adoptions for a in self.agents)
-            })
-            
-            if self.step_count % 10 == 0:
-                for agent in self.agents:
-                     self.logger.log_event('agent_state', {
-                        'step': self.step_count, 'agent_id': agent.unique_id, 'cumulative_interest': agent.average_interest,
-                        'repository_size': agent.knn.feature_vectors.shape[0], 'k_value': agent.knn.k, 'boredom_triggered': False,
-                        'num_self_evals': agent.num_self_evals, 'num_other_evals': agent.num_other_evals, 'num_shares': agent.num_shares,
-                        'num_domain_adoptions': agent.num_domain_adoptions, 'avg_novelty_generated': agent.total_novelty_generated / max(1, agent.num_self_evals),
-                        'avg_interest_generated': agent.total_interest_generated / max(1, agent.num_self_evals)
-                    })
+        self.logger.log_event('step_end', {
+            'step': self.step_count, 'domain_size': len(self.domain), 'self_threshold': self.self_threshold,
+            'domain_threshold': self.domain_threshold, 'boredom_threshold': self.boredom_threshold,
+            'avg_accepted_interest': avg_accepted_interest, 'avg_rejected_interest': avg_rejected_interest,
+            'accepted_count': accepted_count, 'rejected_count': rejected_count, 'avg_knn_size': avg_knn_size,
+            'avg_current_interest': avg_current_interest, 'avg_average_interest': avg_average_interest, 'avg_current_novelty': avg_current_novelty,
+            'total_self_evals': sum(a.num_self_evals for a in self.agents), 'total_other_evals': sum(a.num_other_evals for a in self.agents),
+            'total_shares': sum(a.num_shares for a in self.agents), 'total_domain_adoptions': sum(a.num_domain_adoptions for a in self.agents)
+        })
+        
+        if self.step_count % 10 == 0:
+            for agent in self.agents:
+                    self.logger.log_event('agent_state', {
+                    'step': self.step_count, 'agent_id': agent.unique_id, 'cumulative_interest': agent.average_interest,
+                    'repository_size': agent.knn.feature_vectors.shape[0], 'k_value': agent.knn.k, 'boredom_triggered': False,
+                    'num_self_evals': agent.num_self_evals, 'num_other_evals': agent.num_other_evals, 'num_shares': agent.num_shares,
+                    'num_domain_adoptions': agent.num_domain_adoptions, 'avg_novelty_generated': agent.total_novelty_generated / max(1, agent.num_self_evals),
+                    'avg_interest_generated': agent.total_interest_generated / max(1, agent.num_self_evals)
+                })
 
     def close(self):
         """Clears active processing tracks and flushes all log pipelines."""

@@ -186,6 +186,9 @@ Tracks per-agent novelty/interest, domain size, dynamic thresholds, and interact
 | `logger.py` | Thread-safe CSV, TensorBoard, and composite loggers |
 | `timing_utils.py` | Performance profiling decorator and statistics |
 
+## Performance
+
+If VRAM becomes an issue (not unthinkable at large scales), try reducing the `chunk_size` in `knn.py`. Also attempt to use smaller PCA such as 16, to reduce the amount of required VRAM for the kNN. Also try to reduce the repository size per agent.
 
 ## License
 
