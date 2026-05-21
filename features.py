@@ -1,20 +1,18 @@
 """
-Feature Extraction Module (3.3.2)
-==================================
+Feature Extraction Module
+=========================
 
 Extracts visual features from generated artifacts using a pre-trained ResNet-18.
-Layer 2 is used as the feature extraction point because deeper layers
-(3, 4) suffer from feature homogenization on 32x32 inputs - the spatial
-resolution collapses and distinct images produce near-identical vectors,
-destroying novelty signal (3.3.2).
+Layer 2 is used as the feature extraction point because deeper layers (layers 3 and 4)
+suffer from feature homogenization on small 32x32 inputs, where spatial resolution
+collapses and distinct images produce near-identical vectors.
 
 Supports two dimensionality modes:
 - Raw (128d): Layer 2 → AdaptiveAvgPool → L2 normalize. No reduction.
-- PCA (e.g. 64d): Same backbone, then PCA projection fitted on a
-  calibration batch of random artifacts at startup.
+- PCA (configurable): Layer 2 → AdaptiveAvgPool → PCA projection → L2 normalize.
 
-DEVIATION(paper 3.3.2): PCA reduction is an optional extension.
-Paper: Experiments used 64d PCA; code defaults to raw 128d.
+We recommend to use PCA-16, as it retains nearly identical variance to the full 128d space
+while reducing computational overhead.
 """
 
 import logging
@@ -28,53 +26,76 @@ from timing_utils import time_it
 
 logger = logging.getLogger(__name__)
 
+IMAGENET_MEAN_RGB = (0.485, 0.456, 0.406)
+IMAGENET_STD_RGB = (0.229, 0.224, 0.225)
+
 
 class FeatureExtractor(nn.Module):
     """
-    ResNet-18 Layer 2 feature extractor with optional PCA
-    dimensionality reduction (3.3.2).
+    ResNet-18 Layer 2 feature extractor with optional PCA dimensionality reduction.
     
     Args:
-        output_dims: Target feature dimensions. None or 0 for raw
-                     Layer 2 (128d). Any positive int triggers PCA.
-        use_amp: Enable automatic mixed precision on CUDA.
-        image_generator: Required if output_dims > 0. Used to
-                         generate calibration artifacts for PCA.
-        n_calibration: Number of random artifacts for PCA fitting.
+        output_dims: Target feature dimensions. None or 0 for raw Layer 2 (128d). 
+                     Any positive int triggers PCA projection.
+        use_amp: Enable automatic mixed precision on CUDA execution pathways.
+        image_generator: Required if output_dims > 0. Used to generate calibration
+                         artifacts for fitting the PCA projection layer.
+        n_calibration: Number of random artifacts generated for PCA fitting.
     """
     def __init__(self, output_dims=None, use_amp=True, 
                  image_generator=None, n_calibration=500):
         super().__init__()
         self.use_amp = use_amp
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Register ImageNet normalization constants as persistent buffers
+        self.register_buffer(
+            "imagenet_mean",
+            torch.tensor(IMAGENET_MEAN_RGB, dtype=torch.float32).view(1, 3, 1, 1)
+        )
+        self.register_buffer(
+            "imagenet_std",
+            torch.tensor(IMAGENET_STD_RGB, dtype=torch.float32).view(1, 3, 1, 1)
+        )
         
         logger.info(f"FeatureExtractor using device: {self.device}")
         if self.device.type == "cuda":
             logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
         
-        # --- ResNet-18 backbone up to Layer 2 (3.3.2) ---
+        # Load pre-trained ResNet-18 model weights
         model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-        # Paper (3.3.2): 3x3 kernel, stride=1 replaces default
-        # 7x7 conv1 to preserve spatial detail at 32x32 input.
+        
+        # Modify the first convolutional layer from 7x7 to 3x3 to retain low-level 
+        # spatial details that would otherwise be lost on small 32x32 pixel inputs.
+        pretrained_conv1 = model.conv1.weight.data.clone()  # Shape: (64, 3, 7, 7)
         model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         
+        # Interpolate pre-trained weights into the downscaled 3x3 kernel structure
+        with torch.no_grad():
+            model.conv1.weight.copy_(
+                torch.nn.functional.interpolate(
+                    pretrained_conv1, size=(3, 3),
+                    mode='bilinear', align_corners=False
+                )
+            )
+        
+        # Slice backbone up to Layer 2; deeper configurations homogenize feature signals on small canvases
         self.features = nn.Sequential(
             model.conv1,
             model.bn1,
             model.relu,
             model.layer1,
-            # Paper (3.3.2): Layer 2 is optimal - deeper layers
-            # homogenize features on small images.
             model.layer2
         )
         
-        # Freeze all backbone parameters - we never train this
+        # Freeze network parameters to avoid unintended gradient calculation or optimization adjustments
         for param in self.features.parameters():
             param.requires_grad = False
         
+        # Global pooling to downsample spatial grids to 1x1 dimensions
         self.pooling = nn.AdaptiveAvgPool2d((1, 1))
         
-        # Determine raw backbone output dimensionality
+        # Pass a structural dummy tensor to verify and compute raw backbone output dimensionality
         with torch.no_grad():
             dummy = torch.randn(1, 3, 32, 32)
             dummy_out = self.pooling(self.features(dummy))
@@ -82,13 +103,10 @@ class FeatureExtractor(nn.Module):
         
         logger.info(f"Backbone output: {self.backbone_dims}d")
         
-        # --- Optional PCA reduction ---
-        # DEVIATION(paper 3.3.2): PCA is an optional code feature.
-        # Paper experiments used 64d PCA; code defaults to raw
-        # 128d (output_dims=0) unless explicitly configured.
         self.pca_projection = None
-        self.output_dims = self.backbone_dims  # Default: raw
+        self.output_dims = self.backbone_dims  
         
+        # Configure PCA projection if explicit low-dimensional targets are supplied
         if output_dims and output_dims > 0 and output_dims < self.backbone_dims:
             if image_generator is None:
                 raise ValueError(
@@ -131,34 +149,28 @@ class FeatureExtractor(nn.Module):
         
         logger.info(f"Fitting PCA: generating {n_samples} calibration artifacts...")
         
-        # Generate diverse random expressions across the full depth range
+        # Construct synthetically diverse expression nodes to populate variance space
         expressions = [
             ExpressionNode.create_random(depth=_random.randint(6, 10)) 
             for _ in range(n_samples)
         ]
         
-        # Render to images
+        # Materialize visual expression structures into raw pixel buffers
         image_batch = image_generator.generate_batch(
             expressions, use_amp=self.use_amp
         )
         
-        # Apply ImageNet normalization (same as scheduler.evaluation_phase)
-        mean = torch.tensor(
-            [0.485, 0.456, 0.406], device=self.device
-        ).view(1, 3, 1, 1)
-        std = torch.tensor(
-            [0.229, 0.224, 0.225], device=self.device
-        ).view(1, 3, 1, 1)
-        normalized_batch = (image_batch - mean) / std
+        # Normalize image batches against expected ImageNet standard distributions
+        normalized_batch = (image_batch - self.imagenet_mean) / self.imagenet_std
         
-        # Extract raw backbone features (no PCA yet)
+        # Extract features and convert back to CPU NumPy arrays for Scikit-Learn compliance
         raw_features = self._extract_raw(normalized_batch).cpu().numpy()
         
-        # Fit PCA
+        # Execute principal component calculations across extracted samples
         pca = PCA(n_components=target_dims)
         pca.fit(raw_features)
         
-        # Store as a frozen linear layer: output = input @ components.T
+        # Convert eigenvectors into frozen weight parameters inside a standard Linear block
         self.pca_projection = nn.Linear(
             raw_features.shape[1], target_dims, bias=False
         )
@@ -173,10 +185,31 @@ class FeatureExtractor(nn.Module):
             f"PCA fitted: {raw_features.shape[1]}d → {target_dims}d, "
             f"variance retained: {variance_retained:.1%}"
         )
-    
+        
+        # Release heavy multi-dimensional graphics arrays and initialization memory tracks
+        image_generator.stack_buffer = None
+        image_generator.sp_buffer = None
+        
+        if hasattr(image_generator, '_clear_caches'):
+            image_generator._clear_caches()
+        
+        # Explicit clean up of unused array resources
+        del expressions
+        del image_batch
+        del normalized_batch
+        del raw_features
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        logger.info("PCA calibration complete, calibration buffers released")    
+
     def _extract_raw(self, x):
         """Extract raw pooled features from backbone, no projection or norm."""
-        x = x.to(self.device)
+        # Query persistent buffers to safely discover device mappings across parallel loops
+        model_device = self.imagenet_mean.device
+        if x.device != model_device:
+            x = x.to(model_device, non_blocking=True)
         x = self.features(x)
         x = self.pooling(x)
         return torch.flatten(x, 1)
@@ -186,15 +219,8 @@ class FeatureExtractor(nn.Module):
         """
         Extract features from a batch of normalized image tensors.
         
-        Pipeline (3.3.2):
-            ResNet Layer 2 → AdaptiveAvgPool → [PCA] → L2 norm
-        
-        DEVIATION(paper 3.3.2): L2 normalization here combined
-        with cosine distance in kNN causes double normalization.
-        Paper: Mentions L2 norm for feature vectors.
-        Code: L2 norm applied here AND cosine metric re-normalizes
-              in kNN.batch_evaluate_novelty_*. Harmless with cosine
-              (result is identical) but worth noting.
+        Pipeline:
+            ResNet Layer 2 → AdaptiveAvgPool → [PCA Projection] → L2 Normalization
         
         Args:
             x: Tensor of shape (B, 3, 32, 32), ImageNet-normalized.
@@ -206,17 +232,20 @@ class FeatureExtractor(nn.Module):
             device_type=self.device.type, dtype=torch.float16,
             enabled=self.use_amp and self.device.type == 'cuda'
         ):
+            # Pass image tensor down the backbone network layers
             x = self._extract_raw(x)
             
+            # Route vectors through projection weights if downscaling is enabled
             if self.pca_projection is not None:
                 x = self.pca_projection(x)
             
-            # L2 normalization (paper: consistent distance calculations)
+            # Apply standard L2 normalization across feature dimensions
             x = torch.nn.functional.normalize(x, p=2, dim=1)
         
         return x.to(torch.float32)
     
     def get_memory_usage(self):
+        """Returns VRAM footprint allocations if running on CUDA."""
         if self.device.type == "cuda":
             return {
                 "allocated": torch.cuda.memory_allocated(0) // 1024 ** 2,

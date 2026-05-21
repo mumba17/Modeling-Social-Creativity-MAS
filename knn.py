@@ -1,289 +1,240 @@
 """
-k-Nearest Neighbors (kNN) Memory (3.3.1)
-==========================================
+k-Nearest Neighbors (kNN) Memory
+================================
 
 This module implements a GPU-accelerated k-Nearest Neighbors memory system
 for novelty estimation. Each agent maintains its own kNN instance to track
-the artifacts it has seen and calculate how "novel" a new artifact is
-relative to that experience.
+the artifacts it has observed and calculate how novel a new artifact is
+relative to its recorded experience.
 
-Novelty formula (3.3.1):
+Novelty score calculation:
     novelty = mean_distance(k-NN) / std_dev(k-NN distances)
 
-The division by standard deviation normalizes for varying
-scale across agents with different memory distributions.
+Dividing by the standard deviation normalizes the score across agents 
+with different historical memory distributions.
 """
 
 import torch
 import numpy as np
-import random
 from timing_utils import time_it
 
 class kNN:
     """
     A GPU-accelerated k-Nearest Neighbors implementation for novelty search.
-
-    DEVIATION(paper 3.3.1): Uses a pre-allocated circular buffer
-    with max_size instead of unbounded memory growth.
-    Paper: Implies memory grows without bound.
-    Code: Circular buffer caps at max_size (default 5000),
-          overwriting oldest entries. This prevents GPU OOM
-          and keeps novelty estimation focused on recent
-          experience rather than ancient history.
     """
-    def __init__(self, agent_id=None, max_size=5000, dtype=torch.float32):
+    def __init__(self, agent_id=None, max_size=1000, dtype=torch.float32):
         self.agent_id = agent_id
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = dtype if self.device.type == 'cuda' else torch.float32
         self.max_size = max_size
         
-        # Lazy-initialized circular buffer; allocated on first
-        # add_feature_vectors() call when feature_dim is known.
         self.memory_buffer = None 
-        
-        # DEVIATION(paper 3.3.1): Fixed k instead of elbow method.
-        # Paper: Automated elbow method to dynamically determine
-        #        optimal k per agent.
-        # Code: Fixed k=15 for consistent scientific baseline.
         self.k = 15 
-        
-        # Circular buffer write pointer and occupancy counter
         self.ptr = 0 
         self.current_size = 0
+
+        self._empty_feature_vectors = torch.empty((0,), device=self.device, dtype=self.dtype)
 
     @property
     def feature_vectors(self):
         """
-        Returns the valid (populated) portion of the buffer.
-        Hides zero-padding from consumers; returns empty tensor
-        when no features have been stored yet.
+        Returns the valid populated slice of the memory buffer.
+        Excludes unallocated padding and returns an empty tensor if no features are stored.
         """
         if self.memory_buffer is None or self.current_size == 0:
-            # Empty tensor so .numel() / .shape[0] work safely
-            return torch.tensor([], device=self.device, dtype=self.dtype)
+            return self._empty_feature_vectors
         
-        # kNN is order-independent, so slicing [0:current_size]
-        # is valid even after the buffer wraps around.
         return self.memory_buffer[:self.current_size]
 
+    @time_it
     @staticmethod
     @torch.no_grad()
-    def batch_evaluate_novelty_for_agents(queries, all_memories, memory_indices, agent_ks, metric='cosine'):
+    def batch_evaluate_novelty_for_agents(
+        queries: torch.Tensor,
+        global_buffer: torch.Tensor,
+        current_sizes: torch.Tensor,
+        agent_ks: torch.Tensor,
+        chunk_size: int = 1000
+    ) -> torch.Tensor:
         """
-        Calculates novelty for a batch of agents against their
-        unique memories in a single GPU operation (3.3.1).
-
-        DEVIATION(paper 3.5): Batched GPU computation.
-        Paper: Describes sequential per-agent novelty evaluation.
-        Code: All agents' novelty is computed in one batched
-              matrix multiply for throughput on GPU.
-
-        DEVIATION(paper 3.3.1): Default metric is cosine.
-        Paper: Describes Euclidean distance for kNN.
-        Code: Defaults to cosine; Euclidean available via flag.
+        Calculates novelty scores for a batch of agents against their unique histories
+        using batched matrix multiplications with cosine similarity.
         """
-        num_agents, _ = queries.shape
-        queries = torch.nan_to_num(queries, nan=0.0, posinf=1.0, neginf=-1.0)
-        all_memories = torch.nan_to_num(all_memories, nan=0.0, posinf=1.0, neginf=-1.0)
-        total_memory_size = all_memories.shape[0]
+        num_queries = queries.shape[0]
+        if num_queries == 0:
+            return torch.empty(0, device=queries.device, dtype=queries.dtype)
+            
+        M = global_buffer.shape[1]
         device = queries.device
+        dtype = queries.dtype
 
-        if total_memory_size == 0:
-            return torch.ones(num_agents, device=device)
-
-        if metric == 'cosine':
-            # Cosine similarity: higher = more similar = less novel
-            queries_norm = torch.nn.functional.normalize(queries, p=2, dim=1)
-            all_memories_norm = torch.nn.functional.normalize(all_memories, p=2, dim=1)
-            similarity_matrix = torch.matmul(queries_norm, all_memories_norm.T)
-            # largest=True selects most-similar (nearest) neighbors
-            use_largest = True
-        else:  # euclidean - paper-described metric (3.3.1)
-            # Pairwise L2: ||a-b||² = ||a||² + ||b||² - 2a·b
-            q_sq = (queries ** 2).sum(dim=1, keepdim=True)
-            m_sq = (all_memories ** 2).sum(dim=1, keepdim=True)
-            # Store as negative distance so largest=True
-            # still selects nearest neighbors
-            similarity_matrix = -(q_sq + m_sq.T - 2 * torch.matmul(queries, all_memories.T))
-            use_largest = True
-
-        memory_indices_broadcast = torch.arange(total_memory_size, device=device).unsqueeze(0)
-        
-        start_indices = memory_indices[:, 0].unsqueeze(1)
-        end_indices = memory_indices[:, 1].unsqueeze(1)
-
-        valid_memory_mask = (memory_indices_broadcast >= start_indices) & (memory_indices_broadcast < end_indices)
-        
-        masked_similarity = torch.where(valid_memory_mask, similarity_matrix, -1e9)
-
-        max_k = int(torch.clamp(agent_ks.max(), min=1).item())
-        
-        valid_mem_sizes = memory_indices[:, 1] - memory_indices[:, 0]
-        
-        if not (valid_mem_sizes > 0).any():
-            return torch.ones(num_agents, device=device)
-        
-        actual_k = min(max_k, total_memory_size)
-        if actual_k <= 0:
-            return torch.ones(num_agents, device=device)
-
-        top_k_similarities, _ = torch.topk(masked_similarity, k=actual_k, dim=1, largest=use_largest)
-
-        effective_ks_long = torch.minimum(agent_ks, torch.clamp(valid_mem_sizes, min=0))
-        effective_ks_long = torch.clamp(effective_ks_long, min=1)
-        k_indices = torch.arange(actual_k, device=device).unsqueeze(0)
-        agent_k_mask = k_indices < effective_ks_long.unsqueeze(1)
-
-        masked_top_k_similarities = torch.where(agent_k_mask, top_k_similarities, 0.0)
-        sum_of_similarities = masked_top_k_similarities.sum(dim=1)
-        
-        # Mean of top-k similarities
-        effective_k = effective_ks_long.float()
-        
-        if metric == 'cosine':
-            mean_similarities = sum_of_similarities / effective_k
+        if M == 0:
+            return torch.ones(num_queries, device=device, dtype=dtype)
             
-            # Std dev of k-NN similarities (3.3.1: novelty uses
-            # mean/std ratio for scale-invariance across agents)
-            masked_top_k_sq = torch.where(agent_k_mask, top_k_similarities ** 2, 0.0)
-            sum_sq = masked_top_k_sq.sum(dim=1)
-            mean_sq = sum_sq / effective_k
-            variance = mean_sq - mean_similarities ** 2
-            std_dev = torch.sqrt(torch.clamp(variance, min=1e-8))
+        novelties = []
+        # Process the population queries in chunks to control VRAM footprint
+        for start_idx in range(0, num_queries, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_queries)
             
-            # Cosine novelty: (1 - mean_sim) / std_dev
-            # Higher when query is far from all neighbors
-            raw_novelty = (1.0 - mean_similarities) / torch.clamp(std_dev, min=1e-6)
-            novelty_scores = raw_novelty
-        else:
-            # Euclidean novelty (3.3.1):
-            # mean_distance / std_dev of k-NN distances
-            # Negate back to positive distances
-            mean_distance = -sum_of_similarities / effective_k
+            # Extract current slice of query vectors, masking out invalid numerical artifacts
+            q_chunk = queries[start_idx:end_idx]
+            q_chunk = torch.nan_to_num(q_chunk, nan=0.0, posinf=1.0, neginf=-1.0)
             
-            masked_top_k_sq = torch.where(agent_k_mask, (-top_k_similarities) ** 2, 0.0)
-            sum_sq = masked_top_k_sq.sum(dim=1)
-            mean_sq = sum_sq / effective_k
-            variance = mean_sq - mean_distance ** 2
-            std_dev = torch.sqrt(torch.clamp(variance, min=1e-8))
+            # Extract tracking metadata matching the current chunk indices
+            sizes_chunk = current_sizes[start_idx:end_idx]
+            ks_chunk = agent_ks[start_idx:end_idx]
+            rec_buf = global_buffer[start_idx:end_idx]
             
-            raw_novelty = mean_distance / torch.clamp(std_dev, min=1e-6)
-            novelty_scores = raw_novelty
-        
-        # Agents with ≤1 memory item can't compute meaningful
-        # novelty - default to 1.0 (maximally novel) so they
-        # accept early artifacts and bootstrap their memory.
-        novelty_scores = torch.where(valid_mem_sizes <= 1, torch.ones_like(novelty_scores), novelty_scores)
-        novelty_scores = torch.nan_to_num(novelty_scores, nan=0.0, posinf=1.0, neginf=-1.0)
-        
-        return novelty_scores
-
-    @staticmethod
-    @torch.no_grad()
-    def batch_evaluate_novelty_for_messages(queries, message_to_agent_map, all_memories, memory_indices, agent_ks, metric='cosine'):
-        """
-        Calculates novelty for shared artifacts against recipient
-        memories (3.4, Algorithm 1 step 4).
-
-        Same GPU-batched approach as batch_evaluate_novelty_for_agents
-        but maps each query to its recipient's memory via
-        message_to_agent_map.
-        """
-        num_queries, _ = queries.shape
-        queries = torch.nan_to_num(queries, nan=0.0, posinf=1.0, neginf=-1.0)
-        all_memories = torch.nan_to_num(all_memories, nan=0.0, posinf=1.0, neginf=-1.0)
-        total_memory_size = all_memories.shape[0]
-        device = queries.device
-
-        if total_memory_size == 0 or num_queries == 0:
-            return torch.ones(num_queries, device=device)
-
-        if metric == 'cosine':
-            queries_norm = torch.nn.functional.normalize(queries, p=2, dim=1)
-            all_memories_norm = torch.nn.functional.normalize(all_memories, p=2, dim=1)
-            similarity_matrix = torch.matmul(queries_norm, all_memories_norm.T)
-            use_largest = True
-        else:  # euclidean
-            q_sq = (queries ** 2).sum(dim=1, keepdim=True)
-            m_sq = (all_memories ** 2).sum(dim=1, keepdim=True)
-            similarity_matrix = -(q_sq + m_sq.T - 2 * torch.matmul(queries, all_memories.T))
-            use_largest = True
-
-        recipient_mem_indices = memory_indices[message_to_agent_map]
-        start_indices = recipient_mem_indices[:, 0].unsqueeze(1)
-        end_indices = recipient_mem_indices[:, 1].unsqueeze(1)
-
-        memory_broadcast = torch.arange(total_memory_size, device=device).unsqueeze(0)
-        valid_memory_mask = (memory_broadcast >= start_indices) & (memory_broadcast < end_indices)
-
-        masked_similarity = torch.where(valid_memory_mask, similarity_matrix, -1e9)
-        
-        query_ks = agent_ks[message_to_agent_map]
-        max_k_in_batch = int(torch.clamp(query_ks.max(), min=1).item())
-
-        recipient_mem_sizes = end_indices.squeeze(1) - start_indices.squeeze(1)
-        
-        if not (recipient_mem_sizes > 0).any():
-            return torch.ones(num_queries, device=device)
-        
-        actual_k = min(max_k_in_batch, total_memory_size)
-        if actual_k <= 0:
-            return torch.ones(num_queries, device=device)
-
-        top_k_similarities, _ = torch.topk(masked_similarity, k=actual_k, dim=1, largest=use_largest)
-
-        effective_ks_long = torch.minimum(query_ks, torch.clamp(recipient_mem_sizes, min=0))
-        effective_ks_long = torch.clamp(effective_ks_long, min=1)
-
-        k_indices = torch.arange(actual_k, device=device).unsqueeze(0)
-        agent_k_mask = k_indices < effective_ks_long.unsqueeze(1)
-
-        masked_top_k = torch.where(agent_k_mask, top_k_similarities, 0.0)
-        sum_of_similarities = masked_top_k.sum(dim=1)
-
-        effective_k = effective_ks_long.float()
-        
-        if metric == 'cosine':
-            mean_similarities = sum_of_similarities / effective_k
+            # Normalize vectors to calculate cosine similarity via matrix dot products
+            q_chunk = torch.nn.functional.normalize(q_chunk, p=2, dim=1)
+            sims = torch.bmm(q_chunk.unsqueeze(1), rec_buf.transpose(1, 2)).squeeze(1)
+                
+            # Create a coordinate grid to identify filled slots versus unallocated padding
+            positions = torch.arange(M, device=device).unsqueeze(0)
+            valid = positions < sizes_chunk.unsqueeze(1)
             
-            masked_top_k_sq = torch.where(agent_k_mask, top_k_similarities ** 2, 0.0)
-            sum_sq = masked_top_k_sq.sum(dim=1)
-            mean_sq = sum_sq / effective_k
-            variance = mean_sq - mean_similarities ** 2
-            std_dev = torch.sqrt(torch.clamp(variance, min=1e-8))
+            # Force similarities of empty tracking slots to -1e9 so topk ignores them
+            sims.masked_fill_(~valid, -1e9)
             
-            raw_novelty = (1.0 - mean_similarities) / torch.clamp(std_dev, min=1e-6)
-            novelty_scores = raw_novelty
-        else:
-            mean_distance = -sum_of_similarities / effective_k
+            # Calculate the widest neighborhood parameter required across this batch
+            max_k = int(torch.minimum(torch.tensor(M, device=device), ks_chunk.max()).item())
+            if max_k <= 0:
+                novelties.append(torch.ones(end_idx - start_idx, device=device, dtype=dtype))
+                continue
+                
+            # Pull the closest neighbors based on highest similarity scores
+            top_sims, _ = torch.topk(sims, k=max_k, dim=1, largest=True)
             
-            masked_top_k_sq = torch.where(agent_k_mask, (-top_k_similarities) ** 2, 0.0)
-            sum_sq = masked_top_k_sq.sum(dim=1)
-            mean_sq = sum_sq / effective_k
-            variance = mean_sq - mean_distance ** 2
-            std_dev = torch.sqrt(torch.clamp(variance, min=1e-8))
+            # Limit neighborhood size if the agent has fewer total entries than its k parameter
+            eff_ks = torch.clamp(torch.minimum(ks_chunk, sizes_chunk), min=1)
             
-            raw_novelty = mean_distance / torch.clamp(std_dev, min=1e-6)
-            novelty_scores = raw_novelty
+            # Build index tensor to map across neighborhood rows sequentially
+            k_idx = torch.arange(max_k, device=device).unsqueeze(0)
             
-        novelty_scores = torch.where(recipient_mem_sizes <= 1, torch.ones_like(novelty_scores), novelty_scores)
-        novelty_scores = torch.nan_to_num(novelty_scores, nan=0.0, posinf=1.0, neginf=-1.0)
-
-        return novelty_scores
+            # Isolate entries falling strictly inside each agent's effective k boundary
+            k_mask = k_idx < eff_ks.unsqueeze(1)
+            
+            # Zero out neighbor entries falling outside the active target mask range
+            masked_sims = top_sims.masked_fill(~k_mask, 0.0)
+            sum_sims = masked_sims.sum(dim=1)
+            eff_k_float = eff_ks.float()
+            
+            # Translate similarity scores to standard statistical distance metrics
+            mean = sum_sims / eff_k_float
+            masked_sq = (top_sims ** 2).masked_fill_(~k_mask, 0.0)
+            mean_sq = masked_sq.sum(dim=1) / eff_k_float
+            variance = torch.clamp(mean_sq - mean ** 2, min=1e-9)
+            std = torch.sqrt(variance)
+            
+            # Normalize distance by standard deviation to scale scores uniformly across agents
+            novelty = (1.0 - mean) / torch.clamp(std, min=1e-6)
+                
+            # Default to maximum novelty if the agent has insufficient history
+            novelty.masked_fill_(sizes_chunk <= 1, 1.0)
+            novelty = torch.nan_to_num(novelty, nan=0.0, posinf=1.0, neginf=-1.0)
+            novelties.append(novelty)
+            
+        return torch.cat(novelties) if novelties else torch.empty(0, device=queries.device, dtype=queries.dtype)
 
     @time_it
-    def add_feature_vectors(self, new_feature_vectors, step=0):
+    @staticmethod
+    @torch.no_grad()
+    def batch_evaluate_novelty_for_messages(
+        queries: torch.Tensor,
+        recipient_ids: torch.Tensor,
+        global_buffer: torch.Tensor,
+        current_sizes: torch.Tensor,
+        agent_ks: torch.Tensor,
+        chunk_size: int = 4096
+    ) -> torch.Tensor:
         """
-        Add new feature vectors using the circular buffer.
+        Calculates novelty scores for shared artifacts against recipient memories
+        using vectorized matrix operations with cosine similarity.
+        """
+        num_queries = queries.shape[0]
+        if num_queries == 0:
+            return torch.empty(0, device=queries.device, dtype=queries.dtype)
+            
+        M = global_buffer.shape[1]
+        device = queries.device
+        dtype = queries.dtype
 
-        Overwrites oldest entries when buffer is full, keeping
-        memory bounded at max_size. This is the write path
-        complementing the read-only feature_vectors property.
+        if M == 0:
+            return torch.ones(num_queries, device=device, dtype=dtype)
+            
+        novelties = []
+        # Step through message batches to compute peer evaluations efficiently
+        for start_idx in range(0, num_queries, chunk_size):
+            end_idx = min(start_idx + chunk_size, num_queries)
+            q_chunk = queries[start_idx:end_idx]
+            ids_chunk = recipient_ids[start_idx:end_idx]
+            
+            q_chunk = torch.nan_to_num(q_chunk, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # Map tracking dimensions matching the specific message recipient targets
+            sizes_chunk = current_sizes[ids_chunk]
+            ks_chunk = agent_ks[ids_chunk]
+            
+            # Pull discrete history slices corresponding to target recipient spaces
+            rec_buf = global_buffer[ids_chunk]
+            
+            # Execute batch matrix multiplication to find cross-network cosine similarity
+            q_chunk = torch.nn.functional.normalize(q_chunk, p=2, dim=1)
+            sims = torch.bmm(q_chunk.unsqueeze(1), rec_buf.transpose(1, 2)).squeeze(1)
+                
+            # Generate mask tracking array to separate valid slots from padding indices
+            positions = torch.arange(M, device=device).unsqueeze(0)
+            valid = positions < sizes_chunk.unsqueeze(1)
+            sims.masked_fill_(~valid, -1e9)
+            
+            # Determine maximum neighborhood parameters required across recipients
+            max_k = int(torch.minimum(torch.tensor(M, device=device), ks_chunk.max()).item())
+            if max_k <= 0:
+                novelties.append(torch.ones(end_idx - start_idx, device=device, dtype=dtype))
+                continue
+                
+            # Extract closest neighbor match elements
+            top_sims, _ = torch.topk(sims, k=max_k, dim=1, largest=True)
+            
+            # Bound evaluation thresholds based on current recipient memory allocation depth
+            eff_ks = torch.clamp(torch.minimum(ks_chunk, sizes_chunk), min=1)
+            k_idx = torch.arange(max_k, device=device).unsqueeze(0)
+            k_mask = k_idx < eff_ks.unsqueeze(1)
+            
+            # Mask neighbor components residing beyond current effective limits
+            masked_sims = top_sims.masked_fill(~k_mask, 0.0)
+            sum_sims = masked_sims.sum(dim=1)
+            eff_k_float = eff_ks.float()
+            
+            # Evaluate statistical distribution averages and variances
+            mean = sum_sims / eff_k_float
+            masked_sq = (top_sims ** 2).masked_fill_(~k_mask, 0.0)
+            mean_sq = masked_sq.sum(dim=1) / eff_k_float
+            variance = torch.clamp(mean_sq - mean ** 2, min=1e-9)
+            std = torch.sqrt(variance)
+            novelty = (1.0 - mean) / torch.clamp(std, min=1e-6)
+                
+            # Isolate entries lacking historical context to provide default values
+            novelty.masked_fill_(sizes_chunk <= 1, 1.0)
+            novelty = torch.nan_to_num(novelty, nan=0.0, posinf=1.0, neginf=-1.0)
+            novelties.append(novelty)
+            
+        return torch.cat(novelties) if novelties else torch.empty(0, device=queries.device, dtype=queries.dtype)
+
+    @time_it
+    def add_feature_vectors(self, new_feature_vectors, step=0, pre_normalize: bool = True):
+        """
+        Appends new feature vectors to the memory buffer using a circular structure.
         """
         try:
             new_feature_vectors = new_feature_vectors.to(self.device, dtype=self.dtype)
+            
+            if pre_normalize:
+                new_feature_vectors = torch.nn.functional.normalize(
+                    new_feature_vectors, p=2, dim=1
+                )
                 
-            # Lazy initialization of the main buffer
+            # Lazily initialize storage block if first allocation pass
             if self.memory_buffer is None:
                 feature_dim = new_feature_vectors.shape[1]
                 self.memory_buffer = torch.zeros(
@@ -291,28 +242,29 @@ class kNN:
                     device=self.device, 
                     dtype=self.dtype
                 )
+                self._empty_feature_vectors = torch.empty(
+                    (0, feature_dim), device=self.device, dtype=self.dtype
+                )
             
             num_new = new_feature_vectors.shape[0]
             
-            # Clip if batch is larger than entire memory (edge case)
+            # Cap incoming arrays if update footprint exceeds buffer limits
             if num_new > self.max_size:
                 new_feature_vectors = new_feature_vectors[-self.max_size:]
                 num_new = self.max_size
 
-            # Calculate indices for circular buffer insertion
             start_idx = self.ptr
             end_idx = start_idx + num_new
             
+            # Insert updates linearly or wrap circular buffer bounds across boundaries
             if end_idx <= self.max_size:
-                # No wrapping
                 self.memory_buffer[start_idx:end_idx] = new_feature_vectors
             else:
-                # Wrap around
                 overflow = end_idx - self.max_size
                 self.memory_buffer[start_idx:] = new_feature_vectors[:-overflow]
                 self.memory_buffer[:overflow] = new_feature_vectors[-overflow:]
             
-            # Update pointers
+            # Increment internal write cursor trackers
             self.ptr = (self.ptr + num_new) % self.max_size
             self.current_size = min(self.current_size + num_new, self.max_size)
             

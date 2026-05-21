@@ -1,26 +1,3 @@
-"""
-Simulation Scheduler (Algorithm 1)
-===================================
-
-This module contains the `ParallelScheduler`, which is the heart of the
-simulation. It implements Algorithm 1 from the thesis:
-
-    Per step, for all agents:
-    1. generation_phase()           → Algorithm 1, step 1 (Generate)
-    2. evaluation_phase()           → Image rendering + feature extraction
-    3. individual_evaluation_phase()→ Algorithm 1, step 2 (Self-evaluate)
-    4. sharing_phase()              → Algorithm 1, step 3 (Share decision)
-    5. interaction_phase()          → Algorithm 1, step 4 (Receive & evaluate)
-    6. boredom_phase()              → Algorithm 1, step 5 (Boredom check)
-    7. update_system_thresholds()   → Algorithm 1, step 6 (Update thresholds)
-
-DEVIATION(paper 3.5): All phases use batched GPU pipelines
-rather than sequential per-agent processing. This is a pure
-performance optimization that does not change algorithmic
-semantics; all agents still see the same memory snapshot
-within each phase.
-"""
-
 import torch
 import numpy as np
 import torchvision
@@ -32,1235 +9,757 @@ from features import FeatureExtractor
 from knn import kNN
 from wundtcurve import WundtCurve
 import random
-import itertools
 from collections import deque
 from contextlib import nullcontext
 from timing_utils import time_it
 from torch.nn.parallel import scatter, replicate, parallel_apply, gather
 
+IMAGENET_MEAN_RGB = (0.485, 0.456, 0.406)
+IMAGENET_STD_RGB = (0.229, 0.224, 0.225)
+
 class _FunctionWrapper(torch.nn.Module):
     """
-    A helper class to wrap a stateless function in an nn.Module.
-
-    This allows stateless functions, such as those in the kNN class, to be
-    used with PyTorch's `DataParallel` utilities, which expect an `nn.Module`.
+    Wraps a stateless utility function inside a PyTorch nn.Module container.
+    
+    This encapsulation allows functional execution blocks (such as batched kNN computations)
+    to interface natively with PyTorch's internal multi-GPU parallelization infrastructure.
     """
     def __init__(self, func):
-        """
-        Initializes the wrapper.
-
-        Args:
-            func (callable): The stateless function to wrap.
-        """
         super().__init__()
         self.func = func
+        
     def forward(self, *args, **kwargs):
-        """Executes the wrapped function."""
         return self.func(*args, **kwargs)
 
 class StatsTracker:
     """
-    Tracks rolling statistics for novelty normalization (3.3.3)
-    and dynamic threshold computation (3.4).
-
-    Novelty normalization (3.3.3):
-        P1/P99 percentile bounds from a rolling window of 10,000
-        raw novelty scores. Recalculated every 3 steps, skipping
-        the first 5 steps for initialization.
-
-    Threshold formulas (3.4):
-        self_thresh    = percentile(self_interest_window, 80)
-        domain_thresh  = percentile(other_interest_window, 80)
-        boredom_thresh = percentile(cumulative_interests, 10)
-
-    DEVIATION(paper 3.3.3): Novelty stats are updated only from
-    self-generated artifacts, not from received shared artifacts.
-    This is a design choice: production events define the novelty
-    landscape, consumption events do not.
+    Tracks and maintains rolling statistical distributions of agent behaviors.
     """
     def __init__(self, window_size=10000, threshold_window_size=100):
-        # Novelty normalization window (3.3.3: 10,000 scores)
-        self.novelty_window = deque(maxlen=window_size)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Threshold windows (3.4: rolling window size 100)
+        # Circular buffers for metrics
+        self.novelty_max_size = window_size
+        self.novelty_buffer = torch.zeros(window_size, device=self.device, dtype=torch.float32)
+        self.novelty_ptr = 0
+        self.novelty_size = 0
+        
         self.self_interest_window = deque(maxlen=threshold_window_size)
         self.other_interest_window = deque(maxlen=threshold_window_size)
         self.cumulative_interest_window = deque(maxlen=threshold_window_size)
         
-        # Paper default thresholds (3.4)
         self.p1 = 0.0
         self.p99 = 1.0
-        self.self_thresh = 0.1      # τ_C initial value
-        self.domain_thresh = 0.1    # τ_D initial value
-        self.boredom_thresh = 0.2   # τ_B initial value
+        self.self_thresh = 0.1      
+        self.domain_thresh = 0.1    
+        self.boredom_thresh = 0.2   
 
-    def record_self_interest(self, interest_value):
-        """Record interest from an agent evaluating their own artifact."""
+    def record_self_interest(self, interest_value: float):
+        """Appends a finite self-evaluation score to the rolling queue."""
         if np.isfinite(interest_value):
             self.self_interest_window.append(interest_value)
     
-    def record_other_interest(self, interest_value):
-        """Record interest from an agent evaluating a received artifact."""
+    def record_other_interest(self, interest_value: float):
+        """Appends a finite social-evaluation score to the rolling queue."""
         if np.isfinite(interest_value):
             self.other_interest_window.append(interest_value)
 
-    def update_novelty_stats(self, new_novelty_tensor, step_count, recalc_interval=3):
+    def update_novelty_stats(self, new_novelty_tensor: torch.Tensor, step_count: int, recalc_interval=3):
         """
-        Ingests raw novelty scores and updates P1/P99 bounds (3.3.3).
-
-        Recalculation schedule: every 3 steps, skip first 5.
+        Updates the global 1st and 99th percentile bounds using raw novelty scores.
         """
-        novelty_list = new_novelty_tensor.detach().cpu().numpy().flatten().tolist()
-        # Filter out non-finite values to prevent poisoning the percentile window
-        novelty_list = [v for v in novelty_list if np.isfinite(v)]
-        self.novelty_window.extend(novelty_list)
+        valid_mask = torch.isfinite(new_novelty_tensor)
+        valid_values = new_novelty_tensor[valid_mask].to(self.device, dtype=torch.float32).flatten()
+        num_new = valid_values.numel()
         
-        # 3.3.3: recalculate bounds every recalc_interval steps,
-        # skip first 5 steps to accumulate a meaningful baseline.
-        if step_count >= 5 and step_count % recalc_interval == 0 and len(self.novelty_window) > 100:
-            novelty_array = np.array(self.novelty_window)
-            # Guard against any residual non-finite values in the window
-            novelty_array = novelty_array[np.isfinite(novelty_array)]
-            if len(novelty_array) < 2:
-                return
-            self.p1 = np.percentile(novelty_array, 1)
-            self.p99 = np.percentile(novelty_array, 99)
+        if num_new == 0:
+            return
+            
+        if num_new > self.novelty_max_size:
+            valid_values = valid_values[-self.novelty_max_size:]
+            num_new = self.novelty_max_size
+            
+        end_idx = self.novelty_ptr + num_new
+        if end_idx <= self.novelty_max_size:
+            self.novelty_buffer[self.novelty_ptr:end_idx] = valid_values
+        else:
+            overflow = end_idx - self.novelty_max_size
+            self.novelty_buffer[self.novelty_ptr:] = valid_values[:-overflow]
+            self.novelty_buffer[:overflow] = valid_values[-overflow:]
+            
+        self.novelty_ptr = (self.novelty_ptr + num_new) % self.novelty_max_size
+        self.novelty_size = min(self.novelty_size + num_new, self.novelty_max_size)
+        
+        if step_count >= 5 and step_count % recalc_interval == 0 and self.novelty_size > 100:
+            active_buffer = self.novelty_buffer[:self.novelty_size]
+            
+            quantiles = torch.quantile(active_buffer, torch.tensor([0.01, 0.99], device=self.device))
+            
+            self.p1 = quantiles[0].item()
+            self.p99 = quantiles[1].item()
             
             if self.p99 == self.p1:
                 self.p99 += 1e-6
 
-    def get_normalized_novelty(self, raw_score):
+    def get_normalized_novelty(self, raw_score: float) -> float:
         """
-        P1/P99 percentile normalization (3.3.3).
-        Maps raw kNN distance onto [0,1] for Wundt curve input.
-        Formula: clip((x - P1) / (P99 - P1), 0, 1)
+        Maps a raw continuous scalar distance into a closed [0, 1] range using 
+        the tracked historical percentile bounds.
         """
         if not np.isfinite(raw_score):
             return np.nan
-
         numerator = raw_score - self.p1
         denominator = self.p99 - self.p1
         if not np.isfinite(denominator) or denominator == 0:
             return np.nan
+        return np.clip(numerator / denominator, 0.0, 1.0)
 
-        normalized = numerator / denominator
-        return np.clip(normalized, 0.0, 1.0)
-
-    def update_thresholds(self, all_agents):
+    def update_thresholds(self, all_agents: List[Agent]):
         """
-        Dynamic threshold update (3.4, Algorithm 1 step 6).
-
-        Paper formulas:
-          τ_C = percentile(self_interest_window, 80)
-          τ_D = percentile(other_interest_window, 80)
-          τ_B = percentile(cumulative_interests_all_agents, 10)
+        Computes system-wide performance filters based on active agent distributions.
         """
-        # Self threshold (τ_C): share if interest exceeds this
         if len(self.self_interest_window) > 10:
             self.self_thresh = np.percentile(list(self.self_interest_window), 80)
-        
-        # Domain threshold (τ_D): accept shared artifact if above
         if len(self.other_interest_window) > 10:
             self.domain_thresh = np.percentile(list(self.other_interest_window), 80)
         
-        # Boredom threshold (τ_B): trigger boredom if S_i below
-        cumulative_interests = [a.average_interest for a in all_agents
-                               if np.isfinite(a.average_interest)]
+        cumulative_interests = [a.average_interest for a in all_agents if np.isfinite(a.average_interest)]
         if cumulative_interests:
             self.cumulative_interest_window.extend(cumulative_interests)
             self.boredom_thresh = np.percentile(list(self.cumulative_interest_window), 10)
-        
-        # Safety floor to prevent division-by-zero edge cases
-        self.boredom_thresh = max(self.boredom_thresh, 0.001)
-
+        self.boredom_thresh = max(self.boredom_thresh, -0.99999)
 
 class ParallelScheduler(Scheduler):
     """
-    Orchestrates the simulation using parallel, batched steps.
+    A batch-vectorized orchestration pipeline for multi-agent simulations.
+    
+    Consolidates agent generation, rendering, visual feature extraction, and historical 
+    memory cross-evaluation into highly batched GPU workloads.
     """
     def __init__(self, num_agents: int, artifact_generator: ArtifactGenerator, logger: Logger,
                  share_count: int = 5, uniform_novelty_pref: bool = False,
-                 use_static_noise: bool = False, feature_dims: int = 0,
+                 use_static_noise: bool = False, pca_dims: int = 128,
                  pca_calibration_samples: int = 500, distance_metric: str = 'cosine',
-                 boredom_mode: str = 'classic',
-                 save_images: bool = False,
-                 image_output_dir: str = None):
-        """
-        Initializes the ParallelScheduler.
-
-        Key parameter notes:
-          share_count: N in Algorithm 1 step 3 (paper: configurable)
-          distance_metric: 'cosine' (default) or 'euclidean'
-          boredom_mode: 'classic' (paper) or 'extended' (deviation)
-        """
+                 boredom_mode: str = 'classic', strict_integrity_mode: bool = True,
+                 save_images: bool = False, image_output_dir: str = None,
+                 use_personal_threshold: bool = False):
         self.num_agents = num_agents
         self.artifact_generator = artifact_generator
         self.logger = logger
         self.step_count = 0
-
         self.share_count = share_count
         self.uniform_novelty_pref = uniform_novelty_pref
         self.distance_metric = distance_metric
         self.boredom_mode = boredom_mode
         self.save_images = save_images
         self.image_output_dir = image_output_dir
+        self.use_personal_threshold = use_personal_threshold
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.gpu_stream = torch.cuda.Stream() if self.device.type == 'cuda' else None
-        
         self.use_amp = True
         self.use_static_noise = use_static_noise
+        self.strict_integrity_mode = strict_integrity_mode
 
         self.multi_gpu = torch.cuda.is_available() and torch.cuda.device_count() > 1
         self.device_ids = list(range(torch.cuda.device_count())) if self.multi_gpu else None
-
-        if self.multi_gpu:
-            print(f"Activating multi-GPU mode on {len(self.device_ids)} devices: {self.device_ids}")
-        else:
-            print(f"Running on single device: {self.device}")
 
         if self.save_images and self.image_output_dir:
             os.makedirs(self.image_output_dir, exist_ok=True)
 
         self.image_generator = genart.VectorizedImageGenerator(32, 32, device=self.device, use_static_noise=self.use_static_noise)
+        self.imagenet_mean = torch.tensor(IMAGENET_MEAN_RGB, device=self.device, dtype=torch.float32).view(1, 3, 1, 1)
+        self.imagenet_std = torch.tensor(IMAGENET_STD_RGB, device=self.device, dtype=torch.float32).view(1, 3, 1, 1)
         
-        # Feature extractor setup (3.3.2)
-        # feature_dims=0 → raw 128d; >0 → PCA reduction
-        _output_dims = feature_dims if feature_dims and feature_dims > 0 else None
+        _output_dims = pca_dims if pca_dims and pca_dims > 0 else None
         _feature_extractor = FeatureExtractor(
-            output_dims=_output_dims,
-            use_amp=self.use_amp,
-            image_generator=self.image_generator if _output_dims else None,
-            n_calibration=pca_calibration_samples
+            output_dims=_output_dims, use_amp=self.use_amp,
+            image_generator=self.image_generator if _output_dims else None, n_calibration=pca_calibration_samples
         )
-        if self.multi_gpu:
-            self.feature_extractor = torch.nn.DataParallel(_feature_extractor, device_ids=self.device_ids)
-        else:
-            self.feature_extractor = _feature_extractor.to(self.device)
-
+        self.feature_extractor = torch.nn.DataParallel(_feature_extractor, device_ids=self.device_ids) if self.multi_gpu else _feature_extractor.to(self.device)
+        
+        self.feature_dim = _feature_extractor.output_dims 
+        self.max_memory_size = 2500
+        
+        global_dtype = torch.float32
+        
+        self.global_memory_buffer = torch.zeros(
+            (self.num_agents, self.max_memory_size, self.feature_dim),
+            device=self.device,
+            dtype=global_dtype
+        )
         self.agents: List[Agent] = self._initialize_agents()
-
-        # Domain: shared artifact repository (2.2 DIFI model)
-        # Paper: no curation, artifacts remain indefinitely.
-        self.domain: List[Artifact] = []
-
-        # Initialize Stats Tracker
+        self.domain = deque(maxlen=250_000)
         self.stats = StatsTracker()
+        
+        self.agent_reward_means = torch.tensor([a.wundt.reward_mean for a in self.agents], device=self.device, dtype=torch.float32)
+        self.agent_reward_stds = torch.tensor([a.wundt.reward_std for a in self.agents], device=self.device, dtype=torch.float32)
+        self.agent_punish_means = torch.tensor([a.wundt.punish_mean for a in self.agents], device=self.device, dtype=torch.float32)
+        self.agent_punish_stds = torch.tensor([a.wundt.punish_std for a in self.agents], device=self.device, dtype=torch.float32)
+        self.agent_alphas = torch.tensor([a.wundt.alpha for a in self.agents], device=self.device, dtype=torch.float32)
 
-        # Initialize thresholds using the tracker's defaults
         self.self_threshold = self.stats.self_thresh
         self.domain_threshold = self.stats.domain_thresh
         self.boredom_threshold = self.stats.boredom_thresh
 
-    def _sanitize_tensor(self, tensor: torch.Tensor, source: str,
-                         agent_id: int = None, artifact: Artifact = None,
-                         creator_id: int = None, evaluator_id: int = None) -> torch.Tensor:
-        if tensor is None:
-            return tensor
-
-        finite_mask = torch.isfinite(tensor)
-        if bool(finite_mask.all()):
-            return tensor
-
+    @time_it
+    def _sanitize_tensor(self, tensor: torch.Tensor, source: str) -> torch.Tensor:
+        """Handles numerical singularities in tensors asynchronously."""
+        if tensor is None: return tensor
         return torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=-1.0)
 
-    def _sanitize_scalar(self, value: float, fallback: float, source: str,
-                         agent_id: int = None, artifact: Artifact = None,
-                         creator_id: int = None, evaluator_id: int = None,
-                         trigger_novelty: float = None) -> float:
-        if np.isfinite(value):
-            return float(value)
-
-        return float(fallback) if np.isfinite(fallback) else 0.0
+    @time_it
+    def _sanitize_scalar(self, value: float, fallback: float) -> float:
+        """Sanitizes scalar float values."""
+        return float(value) if np.isfinite(value) else (float(fallback) if np.isfinite(fallback) else 0.0)
 
     @time_it
     def _initialize_agents(self) -> List[Agent]:
-        """
-        Creates and initializes agents with paper-specified
-        parameters (3.3.4, 3.4).
-        """
+        """Instantiates simulation agents with specific preference curves and tracking buffers."""
         agents = []
         for i in range(self.num_agents):
-            # Preferred novelty ~ N(0.5, 0.155) clipped [0,1] (3.3.4)
-            if self.uniform_novelty_pref:
-                preferred_novelty = 0.5
-            else:
-                preferred_novelty = np.clip(np.random.normal(0.5, 0.155), 0, 1)
-
-            # Wundt curve params (3.3.4): all match paper
-            # reward_mean = max(0.1, p-0.2), punish_mean = min(0.9, p+0.2)
-            # σ_r = σ_p = 0.15, α = 1.2
+            preferred_novelty = 0.5 if self.uniform_novelty_pref else np.clip(np.random.normal(0.5, 0.155), 0, 1)
             wundt = WundtCurve(
-                reward_mean=max(0.1, preferred_novelty - 0.2),
-                reward_std=0.15,
-                punish_mean=min(0.9, preferred_novelty + 0.2),
-                punish_std=0.15,
-                alpha=1.2
+                reward_mean=max(0.1, preferred_novelty - 0.2), reward_std=0.15,
+                punish_mean=min(0.9, preferred_novelty + 0.2), punish_std=0.15, alpha=1.2
             )
-            # DEVIATION(paper 3.2): gen_depth 4-6 vs paper 6-10.
-            # Testing has shown that at depth 4-6 we already get a rich variety of artifacts while keeping GPU rendering times manageable. 
-            # Depths above 6 lead to significantly longer render times and larger expression trees (which ramps up the feature extractor workload), 
-            # which can bottleneck the simulation without providing proportional benefits in artifact diversity for our purposes.
-            # Paper: Random tree depth sampled from [6, 10].
-            # Code: Sampled from [4, 6) for faster rendering and
-            #       smaller expression trees.
             agent = Agent(
-                unique_id=i,
-                knn=kNN(agent_id=i, max_size=1000),
-                wundt=wundt,
-                gen_depth=np.random.randint(4, 6),
-                preferred_novelty=preferred_novelty
+                unique_id=i, knn=kNN(agent_id=i, max_size=self.max_memory_size), wundt=wundt,
+                gen_depth=np.random.randint(4, 6), preferred_novelty=preferred_novelty
             )
+            
+            # Inject a slice of the global matrix directly into the agent's kNN.
+            agent.knn.memory_buffer = self.global_memory_buffer[i]
+            agent.knn.dtype = self.global_memory_buffer.dtype
+            agent.knn._empty_feature_vectors = torch.empty((0, self.feature_dim), device=self.device, dtype=self.global_memory_buffer.dtype)
 
-            # Initialize new attributes for tracking stats
-            agent.num_self_evals = 0
-            agent.num_other_evals = 0
-            agent.num_shares = 0
-            agent.num_domain_adoptions = 0
-            agent.total_novelty_generated = 0.0
-            agent.total_interest_generated = 0.0
-
+            agent.num_self_evals, agent.num_other_evals, agent.num_shares, agent.num_domain_adoptions = 0, 0, 0, 0
+            agent.total_novelty_generated, agent.total_interest_generated = 0.0, 0.0
+            agent.self_interest_window = deque(maxlen=100)
+            agent.self_threshold = 0.1
+            
+            agent.recent_expr_strs = deque(maxlen=5)
+            
             agents.append(agent)
             
-            # Log agent initialization details
             self.logger.log_event('agent_init', {
-                'agent_id': agent.unique_id,
-                'preferred_novelty': agent.preferred_novelty,
-                'reward_mean': agent.wundt.reward_mean,
-                'punishment_mean': agent.wundt.punish_mean
+                'agent_id': agent.unique_id, 'preferred_novelty': agent.preferred_novelty,
+                'reward_mean': agent.wundt.reward_mean, 'punishment_mean': agent.wundt.punish_mean
             })
-            
         return agents
 
     @time_it
     def _parallel_apply_custom(self, function, *args):
         """
-        Parallelizes a function across available GPUs with custom data handling.
+        Distributes tensors and metadata across multiple available GPU devices.
         """
         primary_scatter_tensor = args[0]
-        
-        scattered_args = [[] for _ in self.device_ids]
-        
         scattered_primary = scatter(primary_scatter_tensor, self.device_ids)
-        for i in range(len(self.device_ids)):
-            scattered_args[i].append(scattered_primary[i])
+        active_count = len(scattered_primary)
+
+        if active_count == 0: return function(*args)
+        scattered_args = [[scattered_primary[i]] for i in range(active_count)]
 
         for arg in args[1:]:
-            if isinstance(arg, torch.Tensor) and arg.shape[0] == primary_scatter_tensor.shape[0]:
-                scattered_tensor = scatter(arg, self.device_ids)
-                for i in range(len(self.device_ids)):
-                    scattered_args[i].append(scattered_tensor[i])
+            if isinstance(arg, torch.Tensor) and arg.ndim > 0 and arg.shape[0] == primary_scatter_tensor.shape[0]:
+                scattered_tensor = scatter(arg, self.device_ids[:active_count])
+                for i in range(active_count): scattered_args[i].append(scattered_tensor[i])
             else:
-                for i in range(len(self.device_ids)):
-                    replicated_arg = arg.to(f'cuda:{self.device_ids[i]}') if isinstance(arg, torch.Tensor) else arg
-                    scattered_args[i].append(replicated_arg)
+                for i in range(active_count):
+                    scattered_args[i].append(arg.to(scattered_primary[i].device) if isinstance(arg, torch.Tensor) else arg)
         
-        wrapped_module = _FunctionWrapper(function)
-        module_replicas = replicate(wrapped_module, self.device_ids)
-        
-        inputs = [tuple(arg_list) for arg_list in scattered_args]
-
-        outputs = parallel_apply(module_replicas, inputs, devices=self.device_ids)
-
+        module_replicas = replicate(_FunctionWrapper(function), self.device_ids[:active_count])
+        outputs = parallel_apply(module_replicas, [tuple(arg_list) for arg_list in scattered_args], devices=self.device_ids[:active_count])
         return gather(outputs, self.device)
 
+    @time_it
     def _gpu_stream_context(self):
-        """Return a safe stream context manager for CUDA and CPU execution."""
-        if self.device.type == 'cuda' and self.gpu_stream is not None:
-            return torch.cuda.stream(self.gpu_stream)
-        return nullcontext()
+        """Provides an execution context for a non-blocking dedicated CUDA background stream."""
+        return torch.cuda.stream(self.gpu_stream) if (self.device.type == 'cuda' and self.gpu_stream is not None) else nullcontext()
+
+    @time_it
+    def _prepare_knn_batch_state(self, agents: List[Agent], feature_dim: int, device: torch.device):
+        """
+        Prepares memory views and state tracking tensors for batched operations.
+        """
+        num_agents = len(agents)
+        if num_agents == 0:
+             return torch.empty(0, 0, feature_dim, device=device), torch.empty(0, dtype=torch.long, device=device), torch.empty(0, dtype=torch.long, device=device)
+
+            # Return a view mapping active agents directly, matching query length N.
+            # This keeps the expected global_buffer size N to match queries.
+        agent_ids = torch.tensor([a.unique_id for a in agents], dtype=torch.long, device=device)
+        current_sizes = torch.tensor([a.knn.current_size for a in agents], dtype=torch.long, device=device)
+        agent_ks = torch.tensor([a.knn.k for a in agents], dtype=torch.long, device=device)
+
+        return self.global_memory_buffer[agent_ids], current_sizes, agent_ks
 
     @time_it
     def refresh_current_interest_phase(self):
-        """
-        Algorithm 1, step 0: Re-evaluate h_i for current artifact a_i.
-
-        The paper re-computes each agent's interest in their current
-        artifact every step because the agent's kNN memory has grown,
-        making the same artifact less novel over time. This prevents
-        current_interest from acting as a frozen high-water mark.
-
-        Uses cached current_features (set alongside current_expression
-        at every adoption point) to skip image re-rendering.
-        """
+        """Recalculates baseline interest scores for active agent configurations."""
         active = [a for a in self.agents if a.current_features is not None]
-        if not active:
-            return
+        if not active: return
 
         with self._gpu_stream_context():
-            query_batch = torch.stack([a.current_features for a in active])
-            query_batch = self._sanitize_tensor(query_batch, source='refresh.query_batch')
+            query_batch = self._sanitize_tensor(torch.stack([a.current_features for a in active]), 'refresh.query_batch')
+            global_buffer, current_sizes, agent_ks = self._prepare_knn_batch_state(active, query_batch.shape[1], self.device)
+            global_buffer = self._sanitize_tensor(global_buffer, 'refresh.global_buffer')
+            novelty_scores_tensor = self._sanitize_tensor(kNN.batch_evaluate_novelty_for_agents(query_batch, global_buffer, current_sizes, agent_ks, self.distance_metric), 'refresh.novelty_scores')
 
-            feature_dim = query_batch.shape[1]
-            memory_tensors = [
-                agent.knn.feature_vectors
-                if agent.knn.feature_vectors.numel() > 0
-                else torch.empty(0, feature_dim, device=self.device)
-                for agent in active
-            ]
-            consolidated_memories = torch.cat(memory_tensors, dim=0)
-            consolidated_memories = self._sanitize_tensor(
-                consolidated_memories, source='refresh.consolidated_memories'
+            p1, p99 = self.stats.p1, self.stats.p99
+            denom = p99 - p1 if (p99 - p1) != 0 else 1e-6
+            normalized_novelty_tensor = torch.clamp((novelty_scores_tensor - p1) / denom, 0.0, 1.0)
+            
+            active_ids = torch.tensor([a.unique_id for a in active], device=self.device, dtype=torch.long)
+            interest_scores_tensor = WundtCurve.batch_hedonic_value(
+                normalized_novelty_tensor,
+                self.agent_reward_means[active_ids], self.agent_reward_stds[active_ids],
+                self.agent_punish_means[active_ids], self.agent_punish_stds[active_ids],
+                self.agent_alphas[active_ids]
             )
 
-            n_active = len(active)
-            memory_indices = torch.zeros(n_active, 2, dtype=torch.long, device=self.device)
-            agent_ks = torch.zeros(n_active, dtype=torch.long, device=self.device)
-            current_index = 0
-
-            for i, agent in enumerate(active):
-                mem_size = agent.knn.feature_vectors.shape[0]
-                if mem_size > 0:
-                    memory_indices[i] = torch.tensor(
-                        [current_index, current_index + mem_size], device=self.device
-                    )
-                    current_index += mem_size
-                else:
-                    memory_indices[i] = torch.tensor([-1, -1], device=self.device)
-                agent_ks[i] = agent.knn.k
-
-            novelty_scores_tensor = kNN.batch_evaluate_novelty_for_agents(
-                query_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric
-            )
-            novelty_scores_tensor = self._sanitize_tensor(
-                novelty_scores_tensor, source='refresh.novelty_scores'
-            )
-
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
-        novelty_scores = novelty_scores_tensor.cpu().numpy()
+        if self.device.type == 'cuda': torch.cuda.synchronize()
+        novelty_scores = normalized_novelty_tensor.cpu().numpy()
+        interest_scores = interest_scores_tensor.cpu().numpy()
 
         for i, agent in enumerate(active):
-            raw_novelty = novelty_scores[i]
-            normalized_novelty = self._normalize_novelty(raw_novelty)
-            normalized_novelty = self._sanitize_scalar(
-                normalized_novelty, fallback=0.5,
-                source='refresh.normalized_novelty',
-                agent_id=agent.unique_id,
-            )
-
-            refreshed_interest = agent.wundt.hedonic_value(
-                normalized_novelty, experience=agent.knn.current_size
-            )
-            refreshed_interest = self._sanitize_scalar(
-                refreshed_interest,
-                fallback=agent.wundt.hedonic_value(0.5, experience=agent.knn.current_size),
-                source='refresh.interest',
-                agent_id=agent.unique_id,
-            )
-            agent.current_interest = refreshed_interest
-            agent.current_novelty = normalized_novelty
+            agent.current_interest = float(interest_scores[i])
+            agent.current_novelty = float(novelty_scores[i])
 
     @time_it
     def step(self):
-        """
-        Executes one full step of Algorithm 1.
-
-        DEVIATION(paper Algorithm 1): Paper processes inbox before
-        generation (received artifacts influence next generation
-        immediately). Batched architecture requires all sharing and
-        receiving to happen in separate passes, introducing a one-step
-        lag for received artifact influence.
-
-        Phase ordering:
-          1. Generate     → generation_phase()
-          2. Render + FE  → evaluation_phase()
-          3. Self-eval    → individual_evaluation_phase()
-          4. Share decide → sharing_phase()
-          5. Receive eval → interaction_phase()
-          6. Boredom      → boredom_phase()
-          7. Thresholds   → update_system_thresholds()
-        """
+        """Executes a full simulation cycle across all agents."""
         self.refresh_current_interest_phase()
         generated_artifacts = self.generation_phase()
         evaluated_artifacts = self.evaluation_phase(generated_artifacts)
         self.individual_evaluation_phase(evaluated_artifacts)
         messages = self.sharing_phase(evaluated_artifacts)
         interaction_results = self.interaction_phase(messages)
-        
-        if self.step_count != 0:
-            self.boredom_phase()
-            
+        if self.step_count != 0: self.boredom_phase()
         self.update_system_thresholds()
-        
         self._log_step_metrics(interaction_results)
         self.step_count += 1
 
     @time_it
     def generation_phase(self) -> List[Artifact]:
-        """
-        Algorithm 1, step 1: Generate new artifacts for all agents.
-        Each agent breeds its current expression with one from
-        memory, or creates a random tree if no prior expression.
-        """
+        """Generates raw structural expressions for all agents."""
         return self.artifact_generator.generate(self.agents)
 
     @time_it
     def evaluation_phase(self, artifacts: List[Artifact]) -> List[Artifact]:
         """
-        Renders expression trees to images and extracts feature
-        vectors (3.3.2). This is a helper phase not explicitly
-        in Algorithm 1 as it prepares the data needed by
-        individual_evaluation_phase and interaction_phase.
-
-        DEVIATION(paper 3.5): All artifacts are rendered and
-        feature-extracted in one batched GPU pass rather than
-        sequentially per agent.
+        Renders expressions into images and extracts high-dimensional visual feature vectors.
         """
-        if not artifacts:
-            return []
-        
-        expressions = [a.content for a in artifacts]
-        
-        # 1. Generate directly to GPU Tensor (N, 3, H, W) range [0, 1]
-        image_tensor_batch = self.image_generator.generate_batch(expressions, use_amp=self.use_amp)
-        image_tensor_batch = self._sanitize_tensor(image_tensor_batch, source='evaluation.image_generator.output')
-
-        if image_tensor_batch.shape[0] == 0:
-             return []
+        if not artifacts: return []
+        image_tensor_batch = self._sanitize_tensor(self.image_generator.generate_batch([a.content for a in artifacts], use_amp=self.use_amp), 'evaluation.image_generator.output')
+        if image_tensor_batch.shape[0] == 0: return []
 
         if self.save_images and self.image_output_dir:
             image_batch_cpu = image_tensor_batch.detach().to('cpu')
             for i, artifact in enumerate(artifacts):
-                image_path = os.path.join(self.image_output_dir, f"{artifact.id}.png")
-                torchvision.utils.save_image(image_batch_cpu[i], image_path)
+                torchvision.utils.save_image(image_batch_cpu[i], os.path.join(self.image_output_dir, f"{artifact.id}.png"))
         
-        # 2. ImageNet normalization on GPU -- required because
-        # ResNet-18 was pre-trained on ImageNet statistics.
-        # mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-        mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+        normalized_batch = self._sanitize_tensor((image_tensor_batch - self.imagenet_mean) / self.imagenet_std, 'evaluation.normalized_batch')
+        with self._gpu_stream_context(), torch.no_grad():
+            features_batch = self._sanitize_tensor(self.feature_extractor(normalized_batch).detach(), 'evaluation.features_batch')
         
-        normalized_batch = (image_tensor_batch - mean) / std
-        normalized_batch = self._sanitize_tensor(normalized_batch, source='evaluation.normalized_batch')
-
-        # 3. Extract Features
-        with self._gpu_stream_context():
-            with torch.no_grad():
-                features_batch = self.feature_extractor(normalized_batch).detach()
-
-        features_batch = self._sanitize_tensor(features_batch, source='evaluation.features_batch')
-        
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
-
+        if self.device.type == 'cuda': torch.cuda.synchronize()
         for i, artifact in enumerate(artifacts):
-            artifact.features = features_batch[i]
+            artifact.features = features_batch[i].clone()
         return artifacts
 
     @time_it
     def sharing_phase(self, evaluated_artifacts: List[Artifact]) -> List[Dict]:
-        """
-        Algorithm 1, step 3: Share decision.
-        If interest > τ_C (self_threshold), share with N randomly
-        selected agents (3.4).
-        """
+        """Identifies highly interesting expressions and generates messages for randomly selected peers."""
         messages = []
-        
-        # Create a map from producer_id to their just-generated artifact
         agent_to_artifact = {art.producer_id: art for art in evaluated_artifacts}
         
         for agent in self.agents:
-            # Get the artifact this agent JUST generated
             just_generated = agent_to_artifact.get(agent.unique_id)
-            
-            if just_generated and just_generated.interest > self.self_threshold:
+            threshold = agent.self_threshold if self.use_personal_threshold else self.self_threshold
+            if just_generated and just_generated.interest > threshold:
                 agent.num_shares += 1
                 num_recipients = min(self.share_count, self.num_agents - 1)
                 if num_recipients <= 0: continue
-                
                 recipients = random.sample([a.unique_id for a in self.agents if a.unique_id != agent.unique_id], k=num_recipients)
-                
                 for recipient_id in recipients:
-                    messages.append({
-                        'artifact': just_generated,
-                        'sender_id': agent.unique_id,
-                        'recipient_id': recipient_id
-                    })
+                    messages.append({'artifact': just_generated, 'sender_id': agent.unique_id, 'recipient_id': recipient_id})
         return messages
-
 
     @time_it
     def interaction_phase(self, messages: List[Dict]) -> List[Dict]:
-        """
-        Algorithm 1, step 4: Receive & evaluate shared artifacts.
-        Each recipient evaluates via their own kNN + Wundt curve.
-        If interest > τ_D (domain_threshold), artifact enters the
-        domain.
+        """Processes peer sharing networks and evaluates artifacts against recipient histories."""
+        if not messages: return []
 
-        Algorithm 1 additionally adopts the received artifact as
-        current state when h^n_i > h_i, independent of domain entry.
-
-        DEVIATION(paper Algorithm 1): Sender feedback not implemented.
-        Paper: sender receives h^n_i back from recipient. No current
-        agent behavior depends on received feedback.
-        """
-        if not messages:
-            return []
-
-        # Batch evaluate novelty for all messages
         with self._gpu_stream_context():
-            query_features_list = [msg['artifact'].features for msg in messages]
-            query_batch = torch.stack(query_features_list)
-            query_batch = self._sanitize_tensor(query_batch, source='interaction.query_batch')
-            
-            # Prepare memory tensors (same as individual evaluation)
-            memory_tensors = [agent.knn.feature_vectors for agent in self.agents]
-            feature_dim = query_batch.shape[1]
-            memory_tensors = [mem if mem.numel() > 0 else torch.empty(0, feature_dim, device=self.device) for mem in memory_tensors]
-            consolidated_memories = torch.cat(memory_tensors, dim=0)
-            consolidated_memories = self._sanitize_tensor(consolidated_memories, source='interaction.consolidated_memories')
-            
-            memory_indices = torch.zeros(self.num_agents, 2, dtype=torch.long, device=self.device)
-            agent_ks = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
-            current_index = 0
-            for i, agent in enumerate(self.agents):
-                mem_size = agent.knn.feature_vectors.shape[0]
-                if mem_size > 0:
-                    memory_indices[i] = torch.tensor([current_index, current_index + mem_size], device=self.device)
-                    current_index += mem_size
-                else:
-                    memory_indices[i] = torch.tensor([-1, -1], device=self.device)
-                agent_ks[i] = agent.knn.k
-
-            # Map messages to recipient agent IDs for batch processing
+            query_batch = self._sanitize_tensor(torch.stack([msg['artifact'].features for msg in messages]), 'interaction.query_batch')
+            global_buffer, current_sizes, agent_ks = self._prepare_knn_batch_state(self.agents, query_batch.shape[1], self.device)
+            global_buffer = self._sanitize_tensor(global_buffer, 'interaction.global_buffer')
             message_to_agent_map = torch.tensor([msg['recipient_id'] for msg in messages], device=self.device, dtype=torch.long)
 
-            if self.multi_gpu and query_batch.shape[0] > 1:
-                novelty_scores_tensor = self._parallel_apply_custom(
-                    kNN.batch_evaluate_novelty_for_messages,
-                    query_batch, message_to_agent_map, consolidated_memories, memory_indices, agent_ks, self.distance_metric
-                )
+            if self.multi_gpu and query_batch.shape[0] >= len(self.device_ids):
+                novelty_scores_tensor = self._parallel_apply_custom(kNN.batch_evaluate_novelty_for_messages, query_batch, message_to_agent_map, global_buffer, current_sizes, agent_ks, self.distance_metric)
             else:
-                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_messages(
-                    query_batch, message_to_agent_map, consolidated_memories, memory_indices, agent_ks, self.distance_metric
-                )
+                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_messages(query_batch, message_to_agent_map, global_buffer, current_sizes, agent_ks, self.distance_metric)
+            novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, 'interaction.novelty_scores_tensor.after_knn')
 
-            novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, source='interaction.novelty_scores_tensor.after_knn')
+            p1, p99 = self.stats.p1, self.stats.p99
+            denom = p99 - p1 if (p99 - p1) != 0 else 1e-6
+            normalized_novelty_tensor = torch.clamp((novelty_scores_tensor - p1) / denom, 0.0, 1.0)
             
-            # DEVIATION(paper 3.3.3): Only self-generated
-            # artifacts define the novelty landscape.
-            # Receiving is consumption, not production.
+            batch_r_means = self.agent_reward_means[message_to_agent_map]
+            batch_r_stds = self.agent_reward_stds[message_to_agent_map]
+            batch_p_means = self.agent_punish_means[message_to_agent_map]
+            batch_p_stds = self.agent_punish_stds[message_to_agent_map]
+            batch_alphas = self.agent_alphas[message_to_agent_map]
+            
+            interest_scores_tensor = WundtCurve.batch_hedonic_value(
+                normalized_novelty_tensor,
+                batch_r_means, batch_r_stds,
+                batch_p_means, batch_p_stds,
+                batch_alphas
+            )
 
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
-        novelty_scores = novelty_scores_tensor.cpu().numpy()
-
+        if self.device.type == 'cuda': torch.cuda.synchronize()
+        novelty_scores = normalized_novelty_tensor.cpu().numpy()
+        interest_scores = interest_scores_tensor.cpu().numpy()
         interaction_results = []
+        
+        interaction_agent_ids = []
+        interaction_ptrs = []
+        interaction_features = []
+        staged_share_logs = []
         
         for i, message in enumerate(messages):
             recipient = self.agents[message['recipient_id']]
             artifact = message['artifact']
-            
-            raw_novelty = novelty_scores[i]
-            # Use same normalization as generation phase
-            normalized_novelty = self._normalize_novelty(raw_novelty)
-
-            normalized_novelty = self._sanitize_scalar(
-                normalized_novelty,
-                fallback=0.5,
-                source='interaction.scalar.normalized_novelty',
-                agent_id=recipient.unique_id,
-                artifact=artifact,
-                creator_id=artifact.creator_id,
-                evaluator_id=recipient.unique_id,
-                trigger_novelty=float(raw_novelty) if np.isfinite(raw_novelty) else None,
-            )
-
-            interest = recipient.wundt.hedonic_value(normalized_novelty, experience=recipient.knn.current_size)
-            fallback_interest = recipient.wundt.hedonic_value(0.5, experience=recipient.knn.current_size)
-            interest = self._sanitize_scalar(
-                interest,
-                fallback=fallback_interest,
-                source='interaction.scalar.interest',
-                agent_id=recipient.unique_id,
-                artifact=artifact,
-                creator_id=artifact.creator_id,
-                evaluator_id=recipient.unique_id,
-                trigger_novelty=normalized_novelty,
-            )
+            normalized_novelty = float(novelty_scores[i])
+            interest = float(interest_scores[i])
             
             self.stats.record_other_interest(interest)
-            
             recipient.num_other_evals += 1
+            accepted = interest > self.domain_threshold
             
-            accepted = False
-            if interest > self.domain_threshold:
-                accepted = True
-                
-                # Artifact enters the domain (3.4)
+            if accepted:
                 self.domain.append(artifact)
+                recipient.num_domain_adoptions += 1
 
-            # Algorithm 1: adopt if h^n_i > h_i (independent of domain check)
             adopted_received = interest > recipient.current_interest
             if adopted_received:
                 recipient.current_expression = artifact.content._copy()
                 recipient.current_interest = interest
-                recipient.current_features = artifact.features
+                recipient.current_features = artifact.features.clone()
                 recipient.current_artifact_id = artifact.id
                 recipient.current_creator_id = artifact.creator_id
+                recipient.current_expr_str = artifact.expr_str
 
-            # Receiving implies exposure: update recipient memory
-            # even when the artifact is not accepted into domain.
-            # DEVIATION(paper 3.3.1): Uniqueness check only add
-            # to kNN if expression string differs from last 5.
-            expr_str = artifact.content.to_string()
-            recent_exprs = [mem['expression'].to_string() for mem in list(recipient.artifact_memory)[-5:]]
-            if expr_str not in recent_exprs:
-                recipient.knn.add_feature_vectors(artifact.features.unsqueeze(0), self.step_count)
+            artifact_expr_str = artifact.expr_str
+            if artifact_expr_str not in recipient.recent_expr_strs:
+                interaction_agent_ids.append(recipient.unique_id)
+                interaction_ptrs.append(recipient.knn.ptr)
+                interaction_features.append(artifact.features)
+                
                 recipient.artifact_memory.append({
-                    'id': artifact.id,
-                    'expression': artifact.content,
-                    'features': artifact.features,
-                    'creator_id': artifact.creator_id
+                    'id': artifact.id, 'expression': artifact.content, 'expr_str': artifact_expr_str, 'creator_id': artifact.creator_id
                 })
+                recipient.recent_expr_strs.append(artifact_expr_str)
+                
+                recipient.knn.ptr = (recipient.knn.ptr + 1) % self.max_memory_size
+                recipient.knn.current_size = min(recipient.knn.current_size + 1, self.max_memory_size)
             
-            interaction_results.append({
-                'accepted': accepted,
-                'interest': interest,
-                'novelty': normalized_novelty
-            })
-
-            self.logger.log_event('share', {
-                'agent_id': message['sender_id'],
-                'step': self.step_count, 'sender_id': message['sender_id'], 'recipient_id': recipient.unique_id,
-                'artifact_id': artifact.id, 'expression': artifact.content.to_string(),
-                'evaluated_novelty': normalized_novelty, 'evaluated_interest': interest,
-                'accepted': accepted,
-                'adopted': adopted_received,
-                'creator_id': artifact.creator_id,
-                'evaluator_id': recipient.unique_id,
-                'domain_size': len(self.domain)
+            interaction_results.append({'accepted': accepted, 'interest': interest, 'novelty': normalized_novelty})
+            
+            staged_share_logs.append({
+                'agent_id': message['sender_id'], 'step': self.step_count, 'sender_id': message['sender_id'], 'recipient_id': recipient.unique_id,
+                'artifact_id': artifact.id, 'expression': artifact_expr_str, 'evaluated_novelty': normalized_novelty, 'evaluated_interest': interest,
+                'accepted': accepted, 'adopted': adopted_received, 'creator_id': artifact.creator_id, 'evaluator_id': recipient.unique_id, 'domain_size': len(self.domain)
             })
             
+        if interaction_agent_ids:
+            with torch.no_grad():
+                stacked_inter_features = torch.stack(interaction_features)
+                normalized_inter_features = torch.nn.functional.normalize(stacked_inter_features, p=2, dim=1)
+                
+                gpu_inter_agent_ids = torch.tensor(interaction_agent_ids, dtype=torch.long, device=self.device)
+                gpu_inter_ptrs = torch.tensor(interaction_ptrs, dtype=torch.long, device=self.device)
+                
+                self.global_memory_buffer[gpu_inter_agent_ids, gpu_inter_ptrs, :] = normalized_inter_features
+                
+        if staged_share_logs:
+            self.logger.log_events_batch('share', staged_share_logs)
+                
         return interaction_results
 
     @time_it
     def individual_evaluation_phase(self, evaluated_artifacts: List[Artifact]):
-        """
-        Algorithm 1, step 2: Self-evaluate own artifact.
-        ResNet-18 features → kNN novelty → normalize → Wundt
-        curve hedonic value → update cumulative interest (3.3).
-
-        DEVIATION(paper 3.3.1): Uniqueness check which compares
-        expression string against last 5 in memory before adding
-        to kNN. Prevents duplicate features from diluting novelty.
-        Not described in the paper.
-        """
-        if not evaluated_artifacts:
-            return
+        """Evaluates newly generated artifacts and updates the producing agent's state."""
+        if not evaluated_artifacts: return
 
         with self._gpu_stream_context():
-            query_features_list = [art.features for art in evaluated_artifacts]
-            query_batch = torch.stack(query_features_list)
-            query_batch = self._sanitize_tensor(query_batch, source='individual.query_batch')
+            query_batch = self._sanitize_tensor(torch.stack([art.features for art in evaluated_artifacts]), 'individual.query_batch')
+            global_buffer, current_sizes, agent_ks = self._prepare_knn_batch_state(self.agents, query_batch.shape[1], self.device)
+            global_buffer = self._sanitize_tensor(global_buffer, 'individual.global_buffer')
 
-            memory_tensors = [agent.knn.feature_vectors for agent in self.agents]
-            
-            feature_dim = query_batch.shape[1]
-            memory_tensors = [mem if mem.numel() > 0 else torch.empty(0, feature_dim, device=self.device) for mem in memory_tensors]
-
-            consolidated_memories = torch.cat(memory_tensors, dim=0)
-            consolidated_memories = self._sanitize_tensor(consolidated_memories, source='individual.consolidated_memories')
-            
-            memory_indices = torch.zeros(self.num_agents, 2, dtype=torch.long, device=self.device)
-            agent_ks = torch.zeros(self.num_agents, dtype=torch.long, device=self.device)
-            current_index = 0
-            for i, agent in enumerate(self.agents):
-                mem_size = agent.knn.feature_vectors.shape[0]
-                if mem_size > 0:
-                    memory_indices[i] = torch.tensor([current_index, current_index + mem_size], device=self.device)
-                    current_index += mem_size
-                else:
-                    memory_indices[i] = torch.tensor([-1, -1], device=self.device)
-                agent_ks[i] = agent.knn.k
-
-            if self.multi_gpu and query_batch.shape[0] > 1:
-                novelty_scores_tensor = self._parallel_apply_custom(
-                    kNN.batch_evaluate_novelty_for_agents,
-                    query_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric
-                )
+            if self.multi_gpu and query_batch.shape[0] >= len(self.device_ids):
+                novelty_scores_tensor = self._parallel_apply_custom(kNN.batch_evaluate_novelty_for_agents, query_batch, global_buffer, current_sizes, agent_ks, self.distance_metric)
             else:
-                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_agents(
-                    query_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric
-                )
-
-            novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, source='individual.novelty_scores_tensor.after_knn')
+                novelty_scores_tensor = kNN.batch_evaluate_novelty_for_agents(query_batch, global_buffer, current_sizes, agent_ks, self.distance_metric)
             
+            novelty_scores_tensor = self._sanitize_tensor(novelty_scores_tensor, 'individual.novelty_scores_tensor.after_knn')
             self.stats.update_novelty_stats(novelty_scores_tensor, self.step_count)
 
-        if self.device.type == 'cuda':
-            torch.cuda.synchronize()
-        novelty_scores = novelty_scores_tensor.cpu().numpy()
+            p1, p99 = self.stats.p1, self.stats.p99
+            denom = p99 - p1 if (p99 - p1) != 0 else 1e-6
+            normalized_novelty_tensor = torch.clamp((novelty_scores_tensor - p1) / denom, 0.0, 1.0)
+            
+            producer_ids = torch.tensor([art.producer_id for art in evaluated_artifacts], device=self.device, dtype=torch.long)
+            interest_scores_tensor = WundtCurve.batch_hedonic_value(
+                normalized_novelty_tensor,
+                self.agent_reward_means[producer_ids], self.agent_reward_stds[producer_ids],
+                self.agent_punish_means[producer_ids], self.agent_punish_stds[producer_ids],
+                self.agent_alphas[producer_ids]
+            )
+
+        if self.device.type == 'cuda': torch.cuda.synchronize()
+        novelty_scores = normalized_novelty_tensor.cpu().numpy()
+        interest_scores = interest_scores_tensor.cpu().numpy()
+
+        individual_agent_ids = []
+        individual_ptrs = []
+        individual_features = []
+        staged_gen_logs = []
 
         for i, artifact in enumerate(evaluated_artifacts):
             agent = self.agents[artifact.producer_id]
-            features = query_batch[i].unsqueeze(0)
-
-            raw_novelty = novelty_scores[i]
-            normalized_novelty = self._normalize_novelty(raw_novelty)
-            normalized_novelty = self._sanitize_scalar(
-                normalized_novelty,
-                fallback=0.5,
-                source='individual.scalar.normalized_novelty',
-                agent_id=agent.unique_id,
-                artifact=artifact,
-                creator_id=artifact.creator_id,
-                evaluator_id=agent.unique_id,
-                trigger_novelty=float(raw_novelty) if np.isfinite(raw_novelty) else None,
-            )
-
-            interest = agent.wundt.hedonic_value(normalized_novelty, experience=agent.knn.current_size)
-            fallback_interest = agent.wundt.hedonic_value(0.5, experience=agent.knn.current_size)
-            interest = self._sanitize_scalar(
-                interest,
-                fallback=fallback_interest,
-                source='individual.scalar.interest',
-                agent_id=agent.unique_id,
-                artifact=artifact,
-                creator_id=artifact.creator_id,
-                evaluator_id=agent.unique_id,
-                trigger_novelty=normalized_novelty,
-            )
+            normalized_novelty = float(novelty_scores[i])
+            interest = float(interest_scores[i])
 
             self.stats.record_self_interest(interest)
-            
-            # --- Update Agent State ---
-            # DEVIATION(paper 3.4): Hall of fame update not in paper.
+            if np.isfinite(interest):
+                agent.self_interest_window.append(interest)
+                
             agent.update_hall_of_fame(artifact.content, interest, creator_id=artifact.creator_id)
-            
-            # Store previous interest for adoption comparison
             previous_interest = agent.current_interest
-
-            # Needed by extended boredom mode for overwhelm detection
             agent.current_novelty = normalized_novelty
 
             agent.num_self_evals += 1
             agent.total_novelty_generated += normalized_novelty
             agent.total_interest_generated += interest
             
-            # DEVIATION(paper 3.3.1): Uniqueness check
-            # last 5 expressions compared by string to prevent
-            # duplicate features entering kNN memory.
-            expr_str = artifact.content.to_string()
-            recent_exprs = [mem['expression'].to_string() for mem in list(agent.artifact_memory)[-5:]]
-            is_unique = expr_str not in recent_exprs
-            
-            if is_unique:
-                agent.knn.add_feature_vectors(features, self.step_count)
+            artifact_expr_str = artifact.expr_str
+            if artifact_expr_str not in agent.recent_expr_strs:
+                individual_agent_ids.append(agent.unique_id)
+                individual_ptrs.append(agent.knn.ptr)
+                individual_features.append(query_batch[i])
+
                 agent.artifact_memory.append({
-                    'id': artifact.id, 
-                    'expression': artifact.content, 
-                    'features': artifact.features,
-                    'creator_id': artifact.creator_id
+                    'id': artifact.id, 'expression': artifact.content, 'expr_str': artifact_expr_str, 'creator_id': artifact.creator_id
                 })
+                agent.recent_expr_strs.append(artifact_expr_str)
+                
+                agent.knn.ptr = (agent.knn.ptr + 1) % self.max_memory_size
+                agent.knn.current_size = min(agent.knn.current_size + 1, self.max_memory_size)
 
-            artifact.novelty = normalized_novelty
-            artifact.interest = interest
-
-            # Adoption check: is my new creation better than what I had?
+            artifact.novelty, artifact.interest = normalized_novelty, interest
             adopted = False
             if agent.current_expression is None or interest > previous_interest:
                 agent.current_expression = artifact.content
-                agent.current_features = artifact.features
+                agent.current_features = artifact.features.clone()
                 agent.current_interest = interest
                 agent.current_artifact_id = artifact.id
                 agent.current_creator_id = artifact.creator_id
+                agent.current_expr_str = artifact_expr_str
                 adopted = True
 
-            # DEVIATION: S_i update ordering.
-            # Paper: S_i = αS_i + (1-α)h_i runs after inbox processing,
-            #   so adopted received artifacts influence S_i immediately.
-            
-            # Code: S_i updates here (before interaction_phase), so
-            #   artifacts adopted from inbox only affect S_i next step.
-            #   Mitigated by refresh_current_interest_phase which
-            #   recalculates h_i each step anyway.
             agent.average_interest = agent.alpha * agent.average_interest + (1 - agent.alpha) * agent.current_interest
-
-            self.logger.log_event('generation', {
-                'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': artifact.id,
-                'expression': artifact.content.to_string(), 'novelty': normalized_novelty, 'interest': interest,
-                'adopted': adopted,
-                'parent1_id': artifact.parent1_id, 'parent2_id': artifact.parent2_id,
-                'creator_id': artifact.creator_id,
-                'evaluator_id': agent.unique_id,
-                'domain_size': len(self.domain)
+            
+            staged_gen_logs.append({
+                'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': artifact.id, 'expression': artifact_expr_str,
+                'novelty': normalized_novelty, 'interest': interest, 'adopted': adopted, 'parent1_id': artifact.parent1_id, 'parent2_id': artifact.parent2_id,
+                'creator_id': artifact.creator_id, 'evaluator_id': agent.unique_id, 'domain_size': len(self.domain)
             })
 
-    @time_it
-    def boredom_phase(self):
-        """
-        Algorithm 1, step 5: Boredom check (3.4).
-        Triggers when cumulative interest S_i < τ_B.
+        if individual_agent_ids:
+            with torch.no_grad():
+                stacked_features = torch.stack(individual_features)
+                normalized_features = torch.nn.functional.normalize(stacked_features, p=2, dim=1)
+                gpu_agent_ids = torch.tensor(individual_agent_ids, dtype=torch.long, device=self.device)
+                gpu_ptrs = torch.tensor(individual_ptrs, dtype=torch.long, device=self.device)
+                self.global_memory_buffer[gpu_agent_ids, gpu_ptrs, :] = normalized_features
 
-        Two modes are available:
+        if staged_gen_logs:
+            self.logger.log_events_batch('generation', staged_gen_logs)
 
-        CLASSIC MODE (paper-compliant, Algorithm 1):
-            Retrieve a random artifact from the domain, evaluate
-            it through the agent's kNN + Wundt curve, adopt if
-            hedonic value exceeds current interest.
+        @time_it
+        def boredom_phase(self):
+            """Triggers exploratory actions for agents experiencing decreasing baseline interest levels."""
+            classic_agents, chosen_artifacts = [], []
+            for agent in self.agents:
+                if agent.average_interest >= self.boredom_threshold: continue
+                if not self.domain: continue
+                classic_agents.append(agent)
+                chosen_artifacts.append(random.choice(self.domain))
 
-            DEVIATION(paper 3.5): All classic bored agents are
-            processed in a single batched GPU pass (image render
-            → feature extraction → kNN novelty) rather than one
-            GPU dispatch per agent.
+            if not classic_agents: return
 
-        EXTENDED MODE:
-            DEVIATION(paper 3.4): Not described in paper.
-            Paper: One boredom mechanism (random domain retrieval).
-            Code: Differentiates two causes of low interest:
-              - "True Boredom" (low novelty): explore domain
-                or restart with random expression.
-              - "Overwhelm" (high novelty): retreat to a known
-                high-interest artifact from hall of fame.
-        """
-        # ------------------------------------------------------------------
-        # Pass 1: classify bored agents
-        # Extended-mode agents need no GPU work; process them immediately.
-        # Classic-mode agents are collected for a batched GPU pipeline.
-        # ------------------------------------------------------------------
-        classic_agents   = []
-        chosen_artifacts = []
+            cached_features, uncached_indices, uncached_artifacts = [], [] ,[]
+            for idx, art in enumerate(chosen_artifacts):
+                if art.features is not None: cached_features.append((idx, art.features))
+                else:
+                    uncached_indices.append(idx)
+                    uncached_artifacts.append(art)
 
-        for agent in self.agents:
-            if agent.average_interest >= self.boredom_threshold:
-                continue
+            if cached_features: feature_dim = cached_features[0][1].shape[0]
+            elif uncached_artifacts:
+                _probe_batch = self.image_generator.generate_batch([uncached_artifacts[0].content], use_amp=self.use_amp)
+                if _probe_batch.shape[0] == 0: return
+                with self._gpu_stream_context(), torch.no_grad():
+                    _f = self.feature_extractor((_probe_batch - self.imagenet_mean) / self.imagenet_std).detach()
+                if self.device.type == 'cuda': torch.cuda.synchronize()
+                feature_dim = _f.shape[1]
+                uncached_artifacts[0].features = _f[0].clone()
+                cached_features.append((uncached_indices[0], _f[0].clone()))
+                uncached_indices, uncached_artifacts = uncached_indices[1:], uncached_artifacts[1:]
+            else: return
 
-            if self.boredom_mode != 'classic':
-                self._boredom_extended(agent)
-                continue
-
-            # Classic mode: sample a domain artifact now so that the memory
-            # snapshot used for novelty is consistent with the pre-batch state.
-            if not self.domain:
-                continue
-
-            domain_artifact = random.choice(self.domain)
-            classic_agents.append(agent)
-            chosen_artifacts.append(domain_artifact)
-
-        if not classic_agents:
-            return
-
-        # ------------------------------------------------------------------
-        # Feature acquisition: reuse cached features when available.
-        # evaluation_phase already stores artifact.features for every artifact
-        # that passes through the domain, so re-rendering from the GPU is
-        # unnecessary in the common case.  Only artifacts that somehow lack a
-        # cached feature vector (e.g. injected without going through
-        # evaluation_phase) fall back to the GPU pipeline.
-        # ------------------------------------------------------------------
-        cached_features:   list = []   # (agent_idx, feature_tensor) for artifacts with .features
-        uncached_indices:  list = []   # positions in classic_agents that need rendering
-        uncached_artifacts: list = []  # corresponding chosen_artifacts
-
-        for idx, art in enumerate(chosen_artifacts):
-            if art.features is not None:
-                cached_features.append((idx, art.features))
-            else:
-                uncached_indices.append(idx)
-                uncached_artifacts.append(art)
-
-        # Determine feature dimensionality from first available source.
-        if cached_features:
-            feature_dim = cached_features[0][1].shape[0]
-        elif uncached_artifacts:
-            # Need at least one GPU render to learn feature_dim.
-            _probe_batch = self.image_generator.generate_batch(
-                [uncached_artifacts[0].content], use_amp=self.use_amp
-            )
-            if _probe_batch.shape[0] == 0:
-                return
-            _mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-            _std  = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-            with self._gpu_stream_context():
-                with torch.no_grad():
-                    _f = self.feature_extractor((_probe_batch - _mean) / _std).detach()
-            if self.device.type == 'cuda':
-                torch.cuda.synchronize()
-            feature_dim = _f.shape[1]
-            # Store back so this artifact is also cached going forward.
-            uncached_artifacts[0].features = _f[0]
-            cached_features.append((uncached_indices[0], _f[0]))
-            uncached_indices = uncached_indices[1:]
-            uncached_artifacts = uncached_artifacts[1:]
-        else:
-            return  # nothing to process
-
-        # Render any remaining uncached artifacts in one batch.
-        uncached_feature_map: dict = {}
-        if uncached_artifacts:
-            expressions = [art.content for art in uncached_artifacts]
-            image_tensor_batch = self.image_generator.generate_batch(expressions, use_amp=self.use_amp)
-            if image_tensor_batch.shape[0] > 0:
-                mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-                std  = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-                normalized_batch = (image_tensor_batch - mean) / std
-                with self._gpu_stream_context():
-                    with torch.no_grad():
+            uncached_feature_map = {}
+            if uncached_artifacts:
+                image_tensor_batch = self.image_generator.generate_batch([art.content for art in uncached_artifacts], use_amp=self.use_amp)
+                if image_tensor_batch.shape[0] > 0:
+                    normalized_batch = (image_tensor_batch - self.imagenet_mean) / self.imagenet_std
+                    with self._gpu_stream_context(), torch.no_grad():
                         rendered_features = self.feature_extractor(normalized_batch).detach()
-                if self.device.type == 'cuda':
-                    torch.cuda.synchronize()
-                for j, (orig_idx, art) in enumerate(zip(uncached_indices, uncached_artifacts)):
-                    art.features = rendered_features[j]          # cache for future reuse
-                    uncached_feature_map[orig_idx] = rendered_features[j]
+                    if self.device.type == 'cuda': torch.cuda.synchronize()
+                    for j, (orig_idx, art) in enumerate(zip(uncached_indices, uncached_artifacts)):
+                        art.features = rendered_features[j].clone()
+                        uncached_feature_map[orig_idx] = rendered_features[j].clone()
 
-        # Assemble the ordered features_batch tensor (n_classic, feat_dim).
-        features_list = [None] * len(classic_agents)
-        for orig_idx, feat in cached_features:
-            features_list[orig_idx] = feat
-        for orig_idx, feat in uncached_feature_map.items():
-            features_list[orig_idx] = feat
+            features_list = [None] * len(classic_agents)
+            for orig_idx, feat in cached_features: features_list[orig_idx] = feat
+            for orig_idx, feat in uncached_feature_map.items(): features_list[orig_idx] = feat
 
-        valid = [(i, f) for i, f in enumerate(features_list) if f is not None]
-        if not valid:
-            return
+            valid = [(i, f) for i, f in enumerate(features_list) if f is not None]
+            if not valid: return
+            if len(valid) < len(classic_agents):
+                keep_idx = [i for i, _ in valid]
+                classic_agents, chosen_artifacts, features_list = [classic_agents[i] for i in keep_idx], [chosen_artifacts[i] for i in keep_idx], [f for _, f in valid]
 
-        # Drop any agents whose artifact had an empty render (edge case).
-        if len(valid) < len(classic_agents):
-            keep_idx    = [i for i, _ in valid]
-            classic_agents   = [classic_agents[i]   for i in keep_idx]
-            chosen_artifacts = [chosen_artifacts[i] for i in keep_idx]
-            features_list    = [f for _, f in valid]
+            features_batch = torch.stack(features_list)
+            consolidated_memories, memory_indices, agent_ks = self._prepare_knn_batch_state(classic_agents, features_batch.shape[1], self.device)
+            novelty_scores = kNN.batch_evaluate_novelty_for_agents(features_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric)
 
-        features_batch = torch.stack(features_list)   # (n_classic, feat_dim)
-
-        # ------------------------------------------------------------------
-        # Build kNN batch tensors (mirrors interaction_phase)
-        # ------------------------------------------------------------------
-        n_classic   = len(classic_agents)
-        feature_dim = features_batch.shape[1]
-
-        memory_tensors = [
-            agent.knn.feature_vectors if agent.knn.feature_vectors.numel() > 0
-            else torch.empty(0, feature_dim, device=self.device)
-            for agent in classic_agents
-        ]
-        consolidated_memories = torch.cat(memory_tensors, dim=0)  # (total_mem, feat_dim)
-
-        memory_indices = torch.zeros(n_classic, 2, dtype=torch.long, device=self.device)
-        agent_ks       = torch.zeros(n_classic,    dtype=torch.long, device=self.device)
-        current_index  = 0
-
-        for i, agent in enumerate(classic_agents):
-            mem_size = agent.knn.feature_vectors.shape[0]
-            if mem_size > 0:
-                memory_indices[i] = torch.tensor(
-                    [current_index, current_index + mem_size], device=self.device
-                )
-                current_index += mem_size
-            else:
-                memory_indices[i] = torch.tensor([-1, -1], device=self.device)
-            agent_ks[i] = agent.knn.k
-
-        # ------------------------------------------------------------------
-        # Batch novelty computation
-        # ------------------------------------------------------------------
-        novelty_scores = kNN.batch_evaluate_novelty_for_agents(
-            features_batch, consolidated_memories, memory_indices, agent_ks, self.distance_metric
-        )  # shape: (n_classic,)
-
-        # ------------------------------------------------------------------
-        # Pass 2: distribute results
-        # ------------------------------------------------------------------
-        for i, (agent, domain_artifact) in enumerate(zip(classic_agents, chosen_artifacts)):
-            features           = features_batch[i]           # (feat_dim,)
-            raw_novelty        = novelty_scores[i].item()
-            normalized_novelty = self._normalize_novelty(raw_novelty)
-            interest           = agent.wundt.hedonic_value(
-                normalized_novelty,
-                experience=agent.knn.current_size
+            p1, p99 = self.stats.p1, self.stats.p99
+            denom = p99 - p1 if (p99 - p1) != 0 else 1e-6
+            normalized_novelty_tensor = torch.clamp((novelty_scores - p1) / denom, 0.0, 1.0)
+            
+            bored_agent_ids_tensor = torch.tensor([a.unique_id for a in classic_agents], device=self.device, dtype=torch.long)
+            interest_scores_tensor = WundtCurve.batch_hedonic_value(
+                normalized_novelty_tensor,
+                self.agent_reward_means[bored_agent_ids_tensor], self.agent_reward_stds[bored_agent_ids_tensor],
+                self.agent_punish_means[bored_agent_ids_tensor], self.agent_punish_stds[bored_agent_ids_tensor],
+                self.agent_alphas[bored_agent_ids_tensor]
             )
 
-            # Keep boredom memory behavior consistent with other phases:
-            # only add unique expressions compared to the latest history.
-            expr_str = domain_artifact.content.to_string()
-            recent_exprs = [mem['expression'].to_string() for mem in list(agent.artifact_memory)[-5:]]
-            if expr_str not in recent_exprs:
-                agent.knn.add_feature_vectors(features.unsqueeze(0), self.step_count)
-                agent.artifact_memory.append({
-                    'id':         domain_artifact.id,
-                    'expression': domain_artifact.content,
-                    'features':   features,
-                    'creator_id': domain_artifact.creator_id,
+            normalized_novelties = normalized_novelty_tensor.cpu().numpy()
+            interest_scores = interest_scores_tensor.cpu().numpy()
+
+            boredom_agent_ids = []
+            boredom_ptrs = []
+            boredom_features = []
+            staged_boredom_logs = []
+
+            for i, (agent, domain_artifact) in enumerate(zip(classic_agents, chosen_artifacts)):
+                features = features_batch[i]
+                normalized_novelty = float(normalized_novelties[i])
+                interest = float(interest_scores[i])
+
+                artifact_expr_str = domain_artifact.expr_str
+                if artifact_expr_str not in [mem['expr_str'] for mem in list(agent.artifact_memory)[-5:]]:
+                    boredom_agent_ids.append(agent.unique_id)
+                    boredom_ptrs.append(agent.knn.ptr)
+                    boredom_features.append(features)
+
+                    agent.artifact_memory.append({
+                        'id': domain_artifact.id, 'expression': domain_artifact.content, 'expr_str': artifact_expr_str, 'creator_id': domain_artifact.creator_id
+                    })
+                    agent.knn.ptr = (agent.knn.ptr + 1) % self.max_memory_size
+                    agent.knn.current_size = min(agent.knn.current_size + 1, self.max_memory_size)
+
+                adopted = interest > agent.current_interest
+                if adopted:
+                    agent.current_expression = domain_artifact.content._copy()
+                    agent.current_features, agent.current_interest, agent.current_artifact_id, agent.current_creator_id = features.clone(), interest, domain_artifact.id, domain_artifact.creator_id
+                    agent.current_expr_str = artifact_expr_str
+
+                staged_boredom_logs.append({
+                    'step': self.step_count, 'agent_id': agent.unique_id, 'artifact_id': domain_artifact.id, 'expression': artifact_expr_str,
+                    'novelty': normalized_novelty, 'interest': interest, 'adopted': adopted, 'source': 'domain_classic', 'trigger_novelty': getattr(agent, 'current_novelty', 0.5),
+                    'creator_id': domain_artifact.creator_id, 'evaluator_id': agent.unique_id, 'domain_size': len(self.domain)
                 })
 
-            # Algorithm 1 boredom adoption compares retrieved interest
-            # against the agent's current h_i.
-            adopted = interest > agent.current_interest
-            if adopted:
-                agent.current_expression  = domain_artifact.content._copy()
-                agent.current_features    = features
-                agent.current_interest    = interest
-                agent.current_artifact_id = domain_artifact.id
-                agent.current_creator_id  = domain_artifact.creator_id
+            if boredom_agent_ids:
+                with torch.no_grad():
+                    stacked_boredom_feats = torch.stack(boredom_features)
+                    normalized_boredom_feats = torch.nn.functional.normalize(stacked_boredom_feats, p=2, dim=1)
+                    gpu_boredom_agents = torch.tensor(boredom_agent_ids, dtype=torch.long, device=self.device)
+                    gpu_boredom_ptrs = torch.tensor(boredom_ptrs, dtype=torch.long, device=self.device)
+                    self.global_memory_buffer[gpu_boredom_agents, gpu_boredom_ptrs, :] = normalized_boredom_feats
 
-            self.logger.log_event('boredom_adoption', {
-                'step':            self.step_count,
-                'agent_id':        agent.unique_id,
-                'artifact_id':     domain_artifact.id,
-                'expression':      domain_artifact.content.to_string(),
-                'novelty':         normalized_novelty,
-                'interest':        interest,
-                'adopted':         adopted,
-                'source':          'domain_classic',
-                'trigger_novelty': getattr(agent, 'current_novelty', 0.5),
-                'creator_id':      domain_artifact.creator_id,
-                'evaluator_id':    agent.unique_id,
-                'domain_size':     len(self.domain),
-            })
+            if staged_boredom_logs:
+                self.logger.log_events_batch('boredom_adoption', staged_boredom_logs)
 
-    def _boredom_extended(self, agent):
-        """
-        Extended boredom mechanism (Saunders, 2025).
-
-        DEVIATION(paper 3.4): Entire method is not in the paper.
-        Paper: Single boredom mode (random domain retrieval).
-        Code: Differentiates overwhelm (→ hedonic retreat to
-              hall of fame) from true boredom (→ domain explore
-              or random restart).
-
-        Distinguishes between overwhelm (retreat) and true
-        boredom (explore).
-        """
-        current_nov = getattr(agent, 'current_novelty', 0.5)
-        # Recover from NaN-poisoned average_interest so the agent
-        # can rejoin the normal evaluation cycle after boredom.
-        if np.isnan(agent.average_interest):
-            agent.average_interest = 0.0
-        parent_expr = None
-        source_creator_id = agent.unique_id
-        source_type = "random"
-        
-        # Overwhelm detection: novelty exceeds preferred + 0.2
-        # means the agent is seeing things too far from its taste.
-        is_overwhelmed = current_nov > (agent.preferred_novelty + 0.2)
-        
-        if is_overwhelmed and agent.hall_of_fame:
-            # Hedonic retreat: return to best-known artifact
-            entry = agent.hall_of_fame[0]
-            if isinstance(entry, dict):
-                parent_expr = entry.get('expression')
-                source_creator_id = entry.get('creator_id')
-            elif isinstance(entry, (tuple, list)) and len(entry) >= 2:
-                parent_expr = entry[1]
-                # Legacy tuple entries have no creator_id, fallback to prior behavior.
-                source_creator_id = agent.current_creator_id
-
-            if parent_expr is None:
-                parent_expr = genart.ExpressionNode.create_random(depth=agent.gen_depth)
-            if source_creator_id is None:
-                source_creator_id = agent.unique_id
-            source_type = "hedonic_retreat"
-        elif self.domain and random.random() < 0.7:
-            # True boredom: sample domain for fresh inspiration
-            parent_artifact = random.choice(self.domain)
-            parent_expr = parent_artifact.content
-            source_creator_id = parent_artifact.creator_id
-            source_type = "domain_exploration"
-        else:
-            # Creative restart: generate entirely new expression
-            parent_expr = genart.ExpressionNode.create_random(depth=agent.gen_depth)
-            source_creator_id = agent.unique_id
-            source_type = "random_restart"
-        
-        new_expr = parent_expr._copy()
-        new_expr.mutate(rate=0.1, max_depth=agent.gen_depth)
-
-        # Intentionally no immediate kNN update in extended mode.
-        # The mutated expression is evaluated and enters memory
-        # in the regular generation/evaluation pipeline next step.
-        
-        agent.current_expression = new_expr
-        agent.current_features = None
-        agent.current_interest = 0.0
-        agent.current_creator_id = source_creator_id
-        agent.current_artifact_id = None
-        
-        self.logger.log_event('boredom_adoption', {
-            'step': self.step_count,
-            'agent_id': agent.unique_id,
-            'artifact_id': getattr(agent, 'current_artifact_id', None),
-            'expression': new_expr.to_string(),
-            'novelty': current_nov,
-            'interest': 0.0,
-            'adopted': True,
-            'source': source_type,
-            'trigger_novelty': current_nov,
-            'creator_id': source_creator_id,
-            'evaluator_id': agent.unique_id,
-            'domain_size': len(self.domain)
-        })
-
-    def _normalize_novelty(self, raw_novelty):
-        """
-        Normalizes a raw novelty score to the [0, 1] range using the StatsTracker.
-        """
-        normalized = self.stats.get_normalized_novelty(raw_novelty)
-        return normalized
+    @time_it
+    def _normalize_novelty(self, raw_novelty: float) -> float:
+        """Normalizes a raw novelty score using the current tracking stats."""
+        return self.stats.get_normalized_novelty(raw_novelty)
 
     def update_system_thresholds(self):
-        """
-        Algorithm 1, step 6: Update thresholds (3.4).
-        Delegates to StatsTracker, then syncs values back
-        to scheduler attributes for use in next step's phases.
-        """
+        """Recalculates global filtering boundaries from rolling percentile distributions."""
         self.stats.update_thresholds(self.agents)
-        
-        # Sync values to scheduler so they are available for next step's sharing phase
         self.boredom_threshold = self.stats.boredom_thresh
         self.self_threshold = self.stats.self_thresh
         self.domain_threshold = self.stats.domain_thresh
-
-    def _log_step_metrics(self, interaction_results):
-        """
-        Logs aggregate metrics for the current step.
-        """
-        avg_accepted_interest = 0
-        avg_rejected_interest = 0
-        if interaction_results:
-            accepted_interests = [r['interest'] for r in interaction_results if r['accepted']]
-            rejected_interests = [r['interest'] for r in interaction_results if not r['accepted']]
-            if accepted_interests:
-                avg_accepted_interest = sum(accepted_interests) / len(accepted_interests)
-            if rejected_interests:
-                avg_rejected_interest = sum(rejected_interests) / len(rejected_interests)
-
-        avg_knn_size = sum([a.knn.feature_vectors.shape[0] for a in self.agents]) / self.num_agents
-
-        self.logger.log_event('step_end', {
-            'step': self.step_count,
-            'domain_size': len(self.domain),
-            'self_threshold': self.self_threshold,
-            'domain_threshold': self.domain_threshold,
-            'boredom_threshold': self.boredom_threshold,
-            'avg_accepted_interest': avg_accepted_interest,
-            'avg_rejected_interest': avg_rejected_interest,
-            'avg_knn_size': avg_knn_size
-        })
         
-        # Log agent states periodically
-        if self.step_count % 10 == 0:
+        if self.use_personal_threshold:
             for agent in self.agents:
-                 self.logger.log_event('agent_state', {
-                    'step': self.step_count,
-                    'agent_id': agent.unique_id,
-                    'cumulative_interest': agent.average_interest,
-                    'repository_size': agent.knn.feature_vectors.shape[0],
-                    'k_value': agent.knn.k,
-                    'boredom_triggered': False,
-                    'num_self_evals': agent.num_self_evals,
-                    'num_other_evals': agent.num_other_evals,
-                    'num_shares': agent.num_shares,
-                    'num_domain_adoptions': agent.num_domain_adoptions,
-                    'avg_novelty_generated': agent.total_novelty_generated / max(1, agent.num_self_evals),
-                    'avg_interest_generated': agent.total_interest_generated / max(1, agent.num_self_evals)
-                })
+                if len(agent.self_interest_window) > 10:
+                    agent.self_threshold = np.percentile(list(agent.self_interest_window), 80)
+
+        def _log_step_metrics(self, interaction_results: List[Dict]):
+            """Collects step analytics across the agent population and logs the values."""
+            avg_accepted_interest, avg_rejected_interest, accepted_count, rejected_count = 0, 0, 0, 0
+            if interaction_results:
+                accepted_interests = [r['interest'] for r in interaction_results if r['accepted']]
+                rejected_interests = [r['interest'] for r in interaction_results if not r['accepted']]
+                accepted_count, rejected_count = len(accepted_interests), len(rejected_interests)
+                if accepted_interests: avg_accepted_interest = sum(accepted_interests) / accepted_count
+                if rejected_interests: avg_rejected_interest = sum(rejected_interests) / rejected_count
+
+            avg_knn_size = sum([a.knn.feature_vectors.shape[0] for a in self.agents]) / self.num_agents
+            avg_current_interest = sum(a.current_interest for a in self.agents) / self.num_agents
+            avg_average_interest = sum(a.average_interest for a in self.agents) / self.num_agents
+            avg_current_novelty = sum(getattr(a, 'current_novelty', 0.0) for a in self.agents) / self.num_agents
+
+            self.logger.log_event('step_end', {
+                'step': self.step_count, 'domain_size': len(self.domain), 'self_threshold': self.self_threshold,
+                'domain_threshold': self.domain_threshold, 'boredom_threshold': self.boredom_threshold,
+                'avg_accepted_interest': avg_accepted_interest, 'avg_rejected_interest': avg_rejected_interest,
+                'accepted_count': accepted_count, 'rejected_count': rejected_count, 'avg_knn_size': avg_knn_size,
+                'avg_current_interest': avg_current_interest, 'avg_average_interest': avg_average_interest, 'avg_current_novelty': avg_current_novelty,
+                'total_self_evals': sum(a.num_self_evals for a in self.agents), 'total_other_evals': sum(a.num_other_evals for a in self.agents),
+                'total_shares': sum(a.num_shares for a in self.agents), 'total_domain_adoptions': sum(a.num_domain_adoptions for a in self.agents)
+            })
+            
+            if self.step_count % 10 == 0:
+                for agent in self.agents:
+                     self.logger.log_event('agent_state', {
+                        'step': self.step_count, 'agent_id': agent.unique_id, 'cumulative_interest': agent.average_interest,
+                        'repository_size': agent.knn.feature_vectors.shape[0], 'k_value': agent.knn.k, 'boredom_triggered': False,
+                        'num_self_evals': agent.num_self_evals, 'num_other_evals': agent.num_other_evals, 'num_shares': agent.num_shares,
+                        'num_domain_adoptions': agent.num_domain_adoptions, 'avg_novelty_generated': agent.total_novelty_generated / max(1, agent.num_self_evals),
+                        'avg_interest_generated': agent.total_interest_generated / max(1, agent.num_self_evals)
+                    })
 
     def close(self):
-        """
-        Clean up resources.
-        """
-        if hasattr(self.logger, 'close'):
-            self.logger.close()
+        """Clears active processing tracks and flushes all log pipelines."""
+        if hasattr(self.logger, 'close'): self.logger.close()

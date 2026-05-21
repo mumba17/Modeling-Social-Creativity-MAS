@@ -92,6 +92,12 @@ python main.py --save_images --image_output_dir output/images
 python main.py --log_dir runs/experiment_01 --seed 123
 ```
 
+**Strict integrity run** (default behavior, explicit flag shown):
+```bash
+python main.py --log_dir runs/baseline --seed 42 --strict_integrity_mode
+python main.py --log_dir runs/candidate --seed 42 --strict_integrity_mode
+```
+
 **Performance profiling** with per-function timing:
 ```bash
 python main.py --num_agents 100 --num_steps 50 --time_it
@@ -116,6 +122,8 @@ python main.py --num_agents 100 --num_steps 50 --time_it
 | `--image_output_dir` | str | None | Directory for saved images |
 | `--log_dir` | str | None | Override log output directory |
 | `--time_it` | flag | off | Enable per-function timing instrumentation |
+| `--strict_integrity_mode` / `--no_strict_integrity_mode` | flag | strict on | Toggle strict synchronization behavior for trace-stable regression checks |
+| `--fast_nonblocking_transfers` / `--no_fast_nonblocking_transfers` | flag | off | Toggle non-blocking host transfer optimizations for performance profiling |
 
 ## Output
 
@@ -127,7 +135,7 @@ Per-artifact event log with columns:
 
 | Column | Description |
 |---|---|
-| `event_type` | `generation`, `share`, or `boredom_adoption` |
+| `event_type` | `generation`, `share`, `boredom_adoption`, or `step_end` |
 | `step` | Simulation step number |
 | `agent_id` | Agent that triggered the event |
 | `artifact_id` | Unique artifact identifier |
@@ -140,6 +148,11 @@ Per-artifact event log with columns:
 | `sender_id` / `recipient_id` | For share events |
 | `accepted` | Whether the recipient accepted the artifact into the domain |
 | `parent1_id` / `parent2_id` | Parent artifact IDs (if bred) |
+
+`step_end` rows include aggregate parity metrics such as dynamic thresholds,
+interaction accept/reject counts, and system-wide counters (`total_self_evals`,
+`total_other_evals`, `total_shares`, `total_domain_adoptions`) for strict
+run-to-run regression validation.
 
 ### agent_init.csv
 

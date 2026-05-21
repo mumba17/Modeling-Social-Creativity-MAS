@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 from genart import ExpressionNode, QuaternionTensor
-
+        
 class Artifact:
     """
     Represents a generated creative artifact.
@@ -48,6 +48,8 @@ class Artifact:
         self.id = Artifact.next_id
         Artifact.next_id += 1
         self.content = content
+        self.expr_str = content.to_string() 
+        
         self.creator_id = creator_id
         self.producer_id = creator_id if producer_id is None else producer_id
         self.features: Optional[torch.Tensor] = None
@@ -114,7 +116,7 @@ class Agent:
     # Personal artifact memory for breeding partners (3.2.2)
     # Capped to prevent unbounded growth; only recent artifacts
     # matter for breeding selection and uniqueness checks.
-    artifact_memory: List[Dict] = field(default_factory=lambda: deque(maxlen=5000)) 
+    artifact_memory: List[Dict] = field(default_factory=lambda: deque(maxlen=1000)) 
     
     # DEVIATION(paper 3.4): Hall of fame is not described in paper.
     # Paper: No mechanism for retaining top artifacts.
@@ -200,4 +202,7 @@ class Logger(abc.ABC):
         """
         Finalizes the logging process, flushing buffers and closing files.
         """
+        pass
+    @abc.abstractmethod
+    def log_events_batch(self, event_type: str, data_list: List[Dict[str, Any]]):
         pass

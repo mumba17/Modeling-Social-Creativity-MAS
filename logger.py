@@ -1,54 +1,31 @@
-"""
-Simulation Logging (Infrastructure)
-====================================
-
-Concrete implementations of the `Logger` abstract base class.
-
-Thread-safety design:
-    CSVLogger uses a producer/consumer queue with a dedicated
-    writer thread so that simulation threads never block on
-    file I/O. The daemon thread drains the queue and writes
-    rows sequentially, guaranteeing ordered output.
-
-Classes:
-    CSVLogger: Thread-safe CSV writer with event-type filtering.
-    TensorBoardLogger: Writes scalars to TensorBoard.
-    CompositeLogger: Fan-out to multiple loggers.
-"""
-
 import csv
 import queue
 import threading
-import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
 from torch.utils.tensorboard import SummaryWriter
 from framework import Logger
 
+
 class CSVLogger(Logger):
     """
-    Thread-safe CSV logger with event-type filtering.
-
-    Uses a queue + daemon thread pattern so the simulation's
-    hot path (scheduler.step) never blocks on disk I/O.
-    Each CSVLogger instance owns one file and one writer thread.
+    Thread-safe CSV writer decoupling simulation loops from blocking disk I/O operations.
     """
-    def __init__(self, log_file_path: str, fieldnames: list, allowed_event_types: Optional[List[str]] = None):
+    def __init__(self, log_file_path: str, fieldnames: List[str], allowed_event_types: Optional[List[str]] = None):
         self.log_file_path = log_file_path
         self.fieldnames = fieldnames
         self.allowed_event_types = allowed_event_types
-        # Keep a set of fieldnames for faster lookups
+        
+        # Cache field names in a hash set to optimize runtime containment checks
         self._fieldname_set = set(fieldnames)
 
-        # Queue-based async write: simulation thread enqueues,
-        # dedicated writer thread dequeues and flushes to disk.
+        # Instantiate synchronization primitives and thread parameters for asynchronous I/O isolation
         self._queue = queue.Queue()
         self._thread = threading.Thread(target=self._process_queue, daemon=True)
         self._stop_event = threading.Event()
 
-        # Open the file once and keep the handle for the lifetime
-        # of this logger. Avoids repeated open/close syscalls in
-        # the writer thread (previously one open per row).
+        # Open a persistent file descriptor to eliminate repeated open/close syscall overheads
         self._file = open(self.log_file_path, 'w', newline='')
         self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames)
         self._writer.writeheader()
@@ -58,26 +35,27 @@ class CSVLogger(Logger):
 
     def _process_queue(self):
         """
-        The target function for the logger thread. It processes the queue of log entries.
+        Background worker loop extracting logged activities from the buffer queue sequentially.
         """
         while not self._stop_event.is_set() or not self._queue.empty():
             try:
-                # Wait for an item to appear in the queue, with a timeout
+                # Extract records sequentially from the queue with an explicit timeout bound
                 log_data = self._queue.get(timeout=0.1)
                 self._writer.writerow(log_data)
                 self._queue.task_done()
             except queue.Empty:
-                # Timeout occurred, loop again to check stop_event
+                # Re-evaluate shutdown condition status when timeout constraints are hit
                 continue
-            # Periodic flush so data is recoverable on crash
+                
+            # Force an explicit disk flush when the log queue is depleted to prevent data loss on crashes
             if self._queue.empty():
                 self._file.flush()
 
     def log_event(self, event_type: str, data: Dict[str, Any]):
         """
-        Adds a new log entry to the queue, filtering for relevant fields and event types.
+        Enqueues an individual structural tracking event, pruning unmapped value properties.
         """
-        # If this logger has a list of allowed event types, filter for them.
+        # Validate event categories against configuration filters before processing fields
         if self.allowed_event_types and event_type not in self.allowed_event_types:
             return
 
@@ -87,50 +65,81 @@ class CSVLogger(Logger):
         }
         log_entry.update(data)
 
-        # Filter the log entry to only include fields expected in this CSV.
+        # Reconstruct tracking payloads containing only predefined structural attributes
         filtered_entry = {k: v for k, v in log_entry.items() if k in self._fieldname_set}
-
-        # Do not write an entry if it contains no data for the specified fields
         if not filtered_entry:
             return
 
-        # Fill any missing values with None.
+        # Explicitly backfill missing record fields with empty null values
         for field in self.fieldnames:
             if field not in filtered_entry:
                 filtered_entry[field] = None
         
         self._queue.put(filtered_entry)
 
+    def log_events_batch(self, event_type: str, data_list: List[Dict[str, Any]]):
+        """
+        Appends a complete array of events to the log queue using a single lock acquisition pass.
+        """
+        if self.allowed_event_types and event_type not in self.allowed_event_types:
+            return
+
+        timestamp = datetime.now().isoformat()
+        filtered_entries = []
+
+        # Parse structural data transformations completely outside critical thread locks
+        for data in data_list:
+            log_entry = {
+                'timestamp': timestamp,
+                'event_type': event_type,
+            }
+            log_entry.update(data)
+            
+            filtered_entry = {k: v for k, v in log_entry.items() if k in self._fieldname_set}
+            if not filtered_entry:
+                continue
+
+            for field in self.fieldnames:
+                if field not in filtered_entry:
+                    filtered_entry[field] = None
+            
+            filtered_entries.append(filtered_entry)
+
+        if not filtered_entries:
+            return
+
+        # Atomically push processed entries into storage blocks to limit thread lock contention
+        with self._queue.mutex:
+            for entry in filtered_entries:
+                self._queue._put(entry)
+                self._queue.unfinished_tasks += 1
+            self._queue.not_empty.notify()
 
     def close(self):
         """
-        Graceful shutdown: drain queue, then signal thread to exit.
-        Ensures no log entries are lost on simulation end.
+        Executes a graceful shutdown sequence, flushing out remaining tracking metrics safely.
         """
-        # Wait for the queue to be empty
+        # Block until the current queue structures are fully depleted
         self._queue.join()
-
-        # Signal the thread to stop
         self._stop_event.set()
-
-        # Wait for the thread to terminate
         self._thread.join()
 
-        # Close the persistent file handle
+        # Safely shut down active system file streams
         if self._file and not self._file.closed:
             self._file.flush()
             self._file.close()
 
+
 class TensorBoardLogger(Logger):
     """
-    A logger that writes simulation statistics to a TensorBoard log file.
+    Real-time performance metric logger redirecting scalar outputs directly to TensorBoard.
     """
     def __init__(self, log_dir: str):
         self.writer = SummaryWriter(log_dir)
 
     def log_event(self, event_type: str, data: Dict[str, Any]):
         """
-        Logs a single event to TensorBoard.
+        Maps simulation tracking properties onto scalar TensorBoard visualization indices.
         """
         step = data.get('step')
         if step is None:
@@ -145,7 +154,7 @@ class TensorBoardLogger(Logger):
             pass
 
         elif event_type == 'step_end':
-            # Log all system-wide, end-of-step metrics here
+            # Extract and update global network status properties across step intervals
             if 'domain_size' in data:
                 self.writer.add_scalar('Domain/Size', data['domain_size'], step)
 
@@ -163,31 +172,69 @@ class TensorBoardLogger(Logger):
 
             if 'avg_knn_size' in data:
                 self.writer.add_scalar('System/Avg_kNN_Memory_Size', data['avg_knn_size'], step)
+            if 'avg_current_interest' in data:
+                self.writer.add_scalar('System/Avg_Current_Interest', data['avg_current_interest'], step)
+            if 'avg_average_interest' in data:
+                self.writer.add_scalar('System/Avg_Cumulative_Interest', data['avg_average_interest'], step)
+            if 'avg_current_novelty' in data:
+                self.writer.add_scalar('System/Avg_Current_Novelty', data['avg_current_novelty'], step)
 
+            if 'accepted_count' in data:
+                self.writer.add_scalar('Interactions/Accepted_Count', data['accepted_count'], step)
+            if 'rejected_count' in data:
+                self.writer.add_scalar('Interactions/Rejected_Count', data['rejected_count'], step)
+
+            if 'total_self_evals' in data:
+                self.writer.add_scalar('System/Total_Self_Evals', data['total_self_evals'], step)
+            if 'total_other_evals' in data:
+                self.writer.add_scalar('System/Total_Other_Evals', data['total_other_evals'], step)
+            if 'total_shares' in data:
+                self.writer.add_scalar('System/Total_Shares', data['total_shares'], step)
+            if 'total_domain_adoptions' in data:
+                self.writer.add_scalar('System/Total_Domain_Adoptions', data['total_domain_adoptions'], step)
+
+    def log_events_batch(self, event_type: str, data_list: List[Dict[str, Any]]):
+        """
+        Unpacks incoming batch structures to record metrics linearly across target histories.
+        """
+        for data in data_list:
+            self.log_event(event_type, data)
 
     def close(self):
         """
-        Closes the TensorBoard writer.
+        Flushes and destroys the persistent SummaryWriter event tracking instance.
         """
         self.writer.close()
 
+
 class CompositeLogger(Logger):
     """
-    A logger that delegates to a list of other loggers.
+    Structural distribution proxy broadcasting tracking events across multiple downstream loggers.
     """
-    def __init__(self, loggers: list[Logger]):
+    def __init__(self, loggers: List[Logger]):
         self.loggers = loggers
 
     def log_event(self, event_type: str, data: Dict[str, Any]):
         """
-        Logs an event to all contained loggers.
+        Broadcasts an individual simulation transaction down to all registered logger child nodes.
         """
         for logger in self.loggers:
             logger.log_event(event_type, data)
 
+    def log_events_batch(self, event_type: str, data_list: List[Dict[str, Any]]):
+        """
+        Routes batched collection logs down to specialized optimized writer pathways.
+        """
+        for logger in self.loggers:
+            if hasattr(logger, 'log_events_batch'):
+                logger.log_events_batch(event_type, data_list)
+            else:
+                for data in data_list:
+                    logger.log_event(event_type, data)
+
     def close(self):
         """
-        Closes all contained loggers.
+        Triggers resource destruction calls sequentially across dependent logger instances.
         """
         for logger in self.loggers:
             logger.close()
