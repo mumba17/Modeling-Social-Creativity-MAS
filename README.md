@@ -114,8 +114,6 @@ python main.py --num_agents 100 --num_steps 50 --time_it
 | `--seed` | int | 42 | Random seed for reproducibility |
 | `--feature_dims` | int | 0 | Feature dimensionality (0 = raw 128d, >0 = PCA) |
 | `--pca_calibration_samples` | int | 500 | Calibration samples for PCA fitting |
-| `--distance_metric` | str | cosine | kNN distance metric (`cosine` or `euclidean`) |
-| `--boredom_mode` | str | classic | Boredom mechanism (`classic` or `extended`) - Extended is still a WIP and experimental | 
 | `--uniform_novelty_pref` | flag | off | Give all agents identical novelty preference (0.5) |
 | `--use_static_noise` | flag | off | Replace rendering with random noise (debug) |
 | `--save_images` | flag | off | Save rendered artifact PNGs |
